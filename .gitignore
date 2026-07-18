@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.coverage
+htmlcov/
+
+# Virtual environment
+.venv/
+
+# Build artifacts (do not commit per CLAUDE.md)
+build/
+dist/
+*.spec
+
+# Packaged release output (regenerate with: python package.py)
+release/Jungle.exe
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+/.claude
+*.log
