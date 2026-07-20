@@ -1,108 +1,92 @@
-"""Differential tests: the fast engine core must mirror the model exactly."""
+"""Differential testing: the fast core must mirror the immutable model.
+
+Seeded random playouts compare, on every single ply:
+* the exact set of legal moves each generator produces,
+* the Zobrist position key (incremental vs recomputed),
+* the terminal status (winner / draw / ongoing).
+
+Make/undo round-trips and ``from_game_state`` re-derivation are checked too.
+"""
 
 import random
 
-from jungle.engine.core import FastPosition, move_from, move_to, pack_move
-from jungle.model.board import Board, GameState, Move, Piece
-from jungle.model.constants import COLS, Rank, Side
-from jungle.model.zobrist import position_key
+import pytest
+
+from jungle.engine.core import FastPosition, from_model_move
+from jungle.model import zobrist
+from jungle.model.board import GameState
+
+GAMES = 24
+MAX_PLIES_PER_GAME = 120
+SEED_BASE = 20240
 
 
-def _board_with(pieces):
-    rows = [[None for _ in range(7)] for _ in range(9)]
-    for (row, col), piece in pieces.items():
-        rows[row][col] = piece
-    return Board(tuple(tuple(row) for row in rows))
+def _core_terminal(pos: FastPosition) -> tuple[bool, int | None]:
+    """(is_terminal, winner_side_index_or_None) from the fast core."""
+    winner = pos.winner()
+    if winner is not None:
+        return True, winner
+    if pos.is_repetition_draw() or pos.is_ply_cap_draw():
+        return True, None
+    if not pos.legal_moves():
+        return True, pos.side ^ 1  # no legal moves: side to move loses
+    return False, None
 
 
-def _fast_move_set(fast: FastPosition) -> set[tuple[int, int]]:
-    result = set()
-    for m in fast.legal_moves():
-        f, t = move_from(m), move_to(m)
-        result.add(((f // COLS, f % COLS), (t // COLS, t % COLS)))
-    return result
+def _model_terminal(state: GameState) -> tuple[bool, int | None]:
+    if not state.is_game_over:
+        return False, None
+    winner = state.winner
+    return True, None if winner is None else zobrist.side_index(winner)
 
 
-def _assert_in_sync(state: GameState, fast: FastPosition) -> None:
-    model_moves = {(m.from_pos, m.to_pos) for m in state.legal_moves()}
-    assert _fast_move_set(fast) == model_moves
-    assert fast.side is state.current_side
-    assert fast.key == position_key(state.board, state.current_side)
-    assert fast.has_legal_move() == bool(model_moves)
-    over, winner, draw = fast.is_terminal()
-    assert over == (state.winner is not None or state.draw)
-    assert winner == state.winner
-    assert draw == state.draw
+def _assert_in_sync(state: GameState, pos: FastPosition) -> None:
+    model_moves = sorted(from_model_move(m) for m in state.legal_moves())
+    core_moves = sorted(pos.legal_moves())
+    assert model_moves == core_moves
+    assert pos.key == state.position_key
+    assert pos.move_count == state.move_count
+    assert _core_terminal(pos) == _model_terminal(state)
 
 
-def test_directed_positions_match():
-    boards = [
-        # Lion/tiger jumps with rats in and around the river.
-        _board_with({
-            (2, 1): Piece(Side.RED, Rank.LION),
-            (4, 1): Piece(Side.BLUE, Rank.RAT),
-            (6, 1): Piece(Side.BLUE, Rank.DOG),
-            (4, 0): Piece(Side.BLUE, Rank.TIGER),
-        }),
-        # Traps: defender rank 0; rat/elephant specials across media.
-        _board_with({
-            (7, 3): Piece(Side.BLUE, Rank.ELEPHANT),
-            (8, 3): Piece(Side.RED, Rank.RAT),
-            (3, 1): Piece(Side.RED, Rank.RAT),
-            (3, 5): Piece(Side.BLUE, Rank.RAT),
-        }),
-        # Den adjacency and near-endgame race.
-        _board_with({
-            (1, 3): Piece(Side.RED, Rank.LEOPARD),
-            (0, 2): Piece(Side.BLUE, Rank.DOG),
-            (8, 3): Piece(Side.RED, Rank.LION),
-        }),
-        Board.starting(),
-    ]
-    for board in boards:
-        for side in (Side.RED, Side.BLUE):
-            state = GameState(board=board, current_side=side)
-            fast = FastPosition.from_game_state(state)
-            _assert_in_sync(state, fast)
+def _check_make_undo_round_trip(pos: FastPosition) -> None:
+    cells_before = list(pos.cells)
+    key_before = pos.key
+    counts_before = dict(pos.key_counts)
+    pieces_before = list(pos.piece_counts)
+    for move in pos.legal_moves():
+        pos.make(move)
+        pos.undo()
+        assert pos.cells == cells_before
+        assert pos.key == key_before
+        assert pos.key_counts == counts_before
+        assert pos.piece_counts == pieces_before
 
 
-def test_random_playouts_match_model():
-    for seed in range(50):
-        rng = random.Random(seed)
-        state = GameState(board=Board.starting(), current_side=Side.RED)
-        fast = FastPosition.from_game_state(state)
-        for _ in range(120):
-            _assert_in_sync(state, fast)
-            model_moves = sorted(
-                {(m.from_pos, m.to_pos) for m in state.legal_moves()}
-            )
-            if not model_moves:
-                break
-            from_pos, to_pos = rng.choice(model_moves)
-            state = state.after_move(Move(from_pos, to_pos))
-            fast.make(pack_move(from_pos[0] * COLS + from_pos[1], to_pos[0] * COLS + to_pos[1]))
-            if state.winner is not None or state.draw:
-                _assert_in_sync(state, fast)
-                break
+def _check_rederivation(state: GameState, pos: FastPosition) -> None:
+    rebuilt = FastPosition.from_game_state(state)
+    assert rebuilt.cells == pos.cells
+    assert rebuilt.key == pos.key
+    assert rebuilt.key_history == pos.key_history
+    assert rebuilt.key_counts == pos.key_counts
+    assert rebuilt.piece_counts == pos.piece_counts
 
 
-def test_make_undo_roundtrip():
-    rng = random.Random(99)
-    state = GameState(board=Board.starting(), current_side=Side.RED)
-    fast = FastPosition.from_game_state(state)
-    snapshot = (list(fast.cells), fast.side, fast.key, fast.move_count, list(fast.keys))
-    made: list[int] = []
-    for _ in range(40):
-        moves = fast.legal_moves()
-        if not moves or fast.is_terminal()[0]:
+@pytest.mark.parametrize("game_no", range(GAMES))
+def test_seeded_playouts_stay_in_sync(game_no):
+    rng = random.Random(SEED_BASE + game_no)
+    state = GameState.starting()
+    pos = FastPosition.from_game_state(state)
+    for ply in range(MAX_PLIES_PER_GAME):
+        _assert_in_sync(state, pos)
+        if state.is_game_over:
             break
-        move = rng.choice(moves)
-        fast.make(move)
-        made.append(move)
-    for _ in made:
-        fast.undo()
-    assert fast.cells == snapshot[0]
-    assert fast.side == snapshot[1]
-    assert fast.key == snapshot[2]
-    assert fast.move_count == snapshot[3]
-    assert fast.keys == snapshot[4]
+        if ply % 5 == 0:
+            _check_make_undo_round_trip(pos)
+        if ply % 10 == 0:
+            _check_rederivation(state, pos)
+        move = rng.choice(state.legal_moves())
+        state = state.apply_move(move)
+        pos.make(from_model_move(move))
+    # Final position must agree on the outcome.
+    _assert_in_sync(state, pos)

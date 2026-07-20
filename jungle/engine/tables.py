@@ -1,7 +1,9 @@
-"""Precomputed geometry tables for the fast engine core.
+"""Precomputed board geometry for the fast engine core.
 
-All tables are generated from jungle.model.constants at import time so the
-engine can never silently fork the model's terrain definitions.
+Everything here is derived from ``jungle.model.constants`` at import time —
+never hand-duplicated — so the fast core cannot drift from the rules of
+record. Cells are indexed ``row * COLS + col``; sides are 0 (RED) and
+1 (BLUE), matching ``model.zobrist.side_index``.
 """
 
 from __future__ import annotations
@@ -11,14 +13,18 @@ from jungle.model.constants import (
     DEN_POSITIONS,
     ROWS,
     TRAP_POSITIONS,
+    Rank,
     Side,
     Terrain,
+    orthogonal_neighbors,
+    river_jump_paths,
     terrain_at,
 )
 
-CELLS = ROWS * COLS
+CELL_COUNT = ROWS * COLS
 
-_DIRECTIONS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+RED = 0
+BLUE = 1
 
 
 def idx_of(row: int, col: int) -> int:
@@ -33,75 +39,73 @@ def col_of(idx: int) -> int:
     return idx % COLS
 
 
-TERRAIN: tuple[Terrain, ...] = tuple(terrain_at((i // COLS, i % COLS)) for i in range(CELLS))
+def _positions():
+    for row in range(ROWS):
+        for col in range(COLS):
+            yield (row, col)
+
+
+TERRAIN: tuple[Terrain, ...] = tuple(terrain_at(pos) for pos in _positions())
 IS_RIVER: tuple[bool, ...] = tuple(t is Terrain.RIVER for t in TERRAIN)
 
-DEN_IDX: dict[Side, int] = {side: idx_of(*pos) for side, pos in DEN_POSITIONS.items()}
-TRAP_IDX: dict[Side, frozenset[int]] = {
-    side: frozenset(idx_of(*pos) for pos in positions)
-    for side, positions in TRAP_POSITIONS.items()
-}
+NEIGHBORS: tuple[tuple[int, ...], ...] = tuple(
+    tuple(idx_of(r, c) for r, c in orthogonal_neighbors(pos)) for pos in _positions()
+)
 
-# Row/column per cell, and Manhattan distance to each side's own den —
-# precomputed so the evaluator never needs division or enum access per piece.
-ROW: tuple[int, ...] = tuple(i // COLS for i in range(CELLS))
-COL: tuple[int, ...] = tuple(i % COLS for i in range(CELLS))
-DIST_FROM_DEN: dict[Side, tuple[int, ...]] = {
-    side: tuple(
-        abs(ROW[i] - row_of(den)) + abs(COL[i] - col_of(den)) for i in range(CELLS)
-    )
-    for side, den in DEN_IDX.items()
-}
+# DEN_IDX[side] = cell index of that side's own den.
+DEN_IDX: tuple[int, int] = (
+    idx_of(*DEN_POSITIONS[Side.RED]),
+    idx_of(*DEN_POSITIONS[Side.BLUE]),
+)
 
+# TRAPS[side] = cell indices of that side's traps (the ones guarding its den).
+TRAPS: tuple[frozenset[int], frozenset[int]] = (
+    frozenset(idx_of(r, c) for r, c in TRAP_POSITIONS[Side.RED]),
+    frozenset(idx_of(r, c) for r, c in TRAP_POSITIONS[Side.BLUE]),
+)
 
-def _build_neighbors() -> tuple[tuple[int, ...], ...]:
-    neighbors: list[tuple[int, ...]] = []
-    for i in range(CELLS):
-        row, col = row_of(i), col_of(i)
-        cells: list[int] = []
-        for dr, dc in _DIRECTIONS:
-            r, c = row + dr, col + dc
-            if 0 <= r < ROWS and 0 <= c < COLS:
-                cells.append(idx_of(r, c))
-        neighbors.append(tuple(cells))
-    return tuple(neighbors)
+# TRAP_TABLE[side][idx] -> True when idx is one of `side`'s traps. A piece of
+# the OTHER side standing there defends with rank 0.
+TRAP_TABLE: tuple[tuple[bool, ...], tuple[bool, ...]] = (
+    tuple(i in TRAPS[RED] for i in range(CELL_COUNT)),
+    tuple(i in TRAPS[BLUE] for i in range(CELL_COUNT)),
+)
 
 
-NEIGHBORS: tuple[tuple[int, ...], ...] = _build_neighbors()
-
-
-def _build_jumps(horizontal_only: bool) -> tuple[tuple[tuple[int, tuple[int, ...]], ...], ...]:
-    """Precompute river jumps, mirroring Board._jump_moves geometry.
-
-    Each entry maps a cell to ((landing_idx, (crossed_idx, ...)), ...).
-    A jump exists when the cells immediately along a direction are river and
-    the first non-river cell beyond them is on the board.
-    """
+def _build_jumps(rank: Rank) -> tuple[tuple[tuple[int, tuple[int, ...]], ...], ...]:
     table: list[tuple[tuple[int, tuple[int, ...]], ...]] = []
-    for i in range(CELLS):
-        row, col = row_of(i), col_of(i)
-        jumps: list[tuple[int, tuple[int, ...]]] = []
-        for dr, dc in _DIRECTIONS:
-            if horizontal_only and dr != 0:
-                continue
-            r, c = row, col
-            crossed: list[int] = []
-            while True:
-                r += dr
-                c += dc
-                if not (0 <= r < ROWS and 0 <= c < COLS):
-                    break
-                landing = idx_of(r, c)
-                if TERRAIN[landing] is Terrain.RIVER:
-                    crossed.append(landing)
-                    continue
-                if crossed:
-                    jumps.append((landing, tuple(crossed)))
-                break
-        table.append(tuple(jumps))
+    for pos in _positions():
+        entries = tuple(
+            (idx_of(*landing), tuple(idx_of(r, c) for r, c in path))
+            for landing, path in river_jump_paths(pos, rank)
+        )
+        table.append(entries)
     return tuple(table)
 
 
-# Lions jump horizontally and vertically; tigers jump horizontally only.
-JUMPS_LION: tuple[tuple[tuple[int, tuple[int, ...]], ...], ...] = _build_jumps(horizontal_only=False)
-JUMPS_TIGER: tuple[tuple[tuple[int, tuple[int, ...]], ...], ...] = _build_jumps(horizontal_only=True)
+# JUMPS[rank][idx] -> ((landing_idx, (crossed river cell indices)), ...).
+# Tiger geometry intentionally has no vertical entries (locked variant).
+JUMPS: dict[int, tuple[tuple[tuple[int, tuple[int, ...]], ...], ...]] = {
+    int(Rank.LION): _build_jumps(Rank.LION),
+    int(Rank.TIGER): _build_jumps(Rank.TIGER),
+}
+
+# Manhattan distance from each cell to each side's den (for advancement eval).
+DIST_TO_DEN: tuple[tuple[int, ...], tuple[int, ...]] = (
+    tuple(
+        abs(row_of(i) - DEN_POSITIONS[Side.RED][0]) + abs(col_of(i) - DEN_POSITIONS[Side.RED][1])
+        for i in range(CELL_COUNT)
+    ),
+    tuple(
+        abs(row_of(i) - DEN_POSITIONS[Side.BLUE][0]) + abs(col_of(i) - DEN_POSITIONS[Side.BLUE][1])
+        for i in range(CELL_COUNT)
+    ),
+)
+
+MAX_DEN_DIST = max(max(DIST_TO_DEN[RED]), max(DIST_TO_DEN[BLUE]))
+
+# Full pairwise Manhattan distance between cells (for animal-proximity terms).
+CELL_DIST: tuple[tuple[int, ...], ...] = tuple(
+    tuple(abs(row_of(a) - row_of(b)) + abs(col_of(a) - col_of(b)) for b in range(CELL_COUNT))
+    for a in range(CELL_COUNT)
+)

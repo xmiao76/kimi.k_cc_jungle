@@ -1,103 +1,109 @@
-"""AI engine shell: converts model states to the fast core and runs the search."""
+"""Public AI interface: difficulty presets, synchronous chooser, QThread worker."""
 
 from __future__ import annotations
 
 import threading
+from typing import Optional
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PySide6.QtCore import QThread, Signal
 
 from jungle.engine.core import FastPosition, to_model_move
-from jungle.engine.search import SearchConfig, Searcher, _TTEntry
+from jungle.engine.evaluation import DEFAULT_WEIGHTS, EvalWeights
+from jungle.engine.search import SearchConfig, Searcher, SearchResult
 from jungle.model.board import GameState, Move
-from jungle.model.constants import Side
 
-DEFAULT_TIME_LIMIT_S = 1.5
+DIFFICULTY_PRESETS: dict[str, SearchConfig] = {
+    "easy": SearchConfig(max_depth=2, soft_limit_s=0.3, hard_limit_s=0.8),
+    "medium": SearchConfig(max_depth=4, soft_limit_s=1.0, hard_limit_s=2.5),
+    "hard": SearchConfig(max_depth=6, soft_limit_s=2.0, hard_limit_s=5.0),
+}
+
+STRENGTH_NAMES = tuple(DIFFICULTY_PRESETS)
+
+
+class NoLegalMoveError(RuntimeError):
+    """Raised when the AI is asked to move in a terminal position."""
 
 
 class AI:
-    """Jungle AI: iterative-deepening PVS over the fast engine core.
-
-    `depth` caps the search depth; `time_limit_s` sets the soft wall-clock
-    budget per move (the hard abort fires at 2.5x the soft limit). A full
-    `SearchConfig` can be injected instead (used by the gauntlet to replay
-    previous engine generations). The transposition table persists across
-    moves with generation aging unless disabled in the config. The search
-    is deterministic when it reaches `max_depth` within the time budget.
-    """
+    """Synchronous move chooser. A fresh ``Searcher`` (and therefore a fresh
+    transposition table) is built for every move — see ``engine.search`` for
+    why persistent TTs are banned on this game."""
 
     def __init__(
         self,
-        side: Side,
-        depth: int = 3,
-        time_limit_s: float | None = None,
-        config: SearchConfig | None = None,
+        strength: str = "medium",
+        depth: Optional[int] = None,
+        time_limit: Optional[float] = None,
+        weights: Optional[EvalWeights] = None,
     ) -> None:
-        self.side = side
-        if config is None:
-            soft = time_limit_s if time_limit_s is not None else DEFAULT_TIME_LIMIT_S
-            config = SearchConfig(
-                max_depth=max(1, depth),
-                soft_limit_s=soft,
-                hard_limit_s=soft * 2.5,
-            )
-        self.config = config
-        self._tt: dict[int, _TTEntry] = {}
-        self._tt_generation = 0
-
-    def choose_move(
-        self,
-        state: GameState,
-        on_info=None,
-        abort_event: threading.Event | None = None,
-    ) -> Move | None:
-        """Return the best move for the side to move, or None if unavailable."""
-        if state.winner is not None or state.draw:
-            return None
-        pos = FastPosition.from_game_state(state)
-        if not pos.has_legal_move():
-            return None
-        self._tt_generation = (self._tt_generation + 1) & 0xFF
-        searcher = Searcher(
-            self.config,
-            on_info=on_info,
-            abort_event=abort_event,
-            tt=self._tt if self.config.use_persistent_tt else None,
-            generation=self._tt_generation,
+        if strength not in DIFFICULTY_PRESETS:
+            raise ValueError(f"unknown strength {strength!r}; expected one of {STRENGTH_NAMES}")
+        base = DIFFICULTY_PRESETS[strength]
+        max_depth = depth if depth is not None else base.max_depth
+        soft = time_limit if time_limit is not None else base.soft_limit_s
+        hard = time_limit * 2.5 if time_limit is not None else base.hard_limit_s
+        self.config = SearchConfig(
+            max_depth=max_depth,
+            soft_limit_s=soft,
+            hard_limit_s=hard,
+            weights=weights if weights is not None else DEFAULT_WEIGHTS,
         )
-        result = searcher.search(pos)
-        if result.best_move == 0 and result.depth == 0:
-            return None
-        return to_model_move(result.best_move)
+
+    def choose_move(self, state: GameState) -> tuple[Move, SearchResult]:
+        pos = FastPosition.from_game_state(state)
+        result = Searcher(self.config).search(pos)
+        best = result.best_move
+        if best == 0:
+            legal = pos.legal_moves()
+            if not legal:
+                raise NoLegalMoveError("no legal moves — the game is over")
+            best = legal[0]
+        return to_model_move(best), result
 
 
 class AIWorker(QThread):
-    """Run the AI search in a background thread."""
+    """Runs the AI off the GUI thread so the board stays responsive.
 
-    move_chosen = pyqtSignal(object)
-    search_info = pyqtSignal(int, int, int)  # depth, score_cp, nodes
-    error = pyqtSignal(str)
+    Emits ``result_ready(Move)`` with the chosen move (unless aborted) and
+    ``search_info(depth, score, nodes)`` after each completed iteration for
+    the status bar. All search state lives inside ``run()``; the worker only
+    reads the immutable ``GameState`` snapshot it was given.
+    """
+
+    result_ready = Signal(object)
+    search_info = Signal(int, int, int)
 
     def __init__(self, ai: AI, state: GameState, parent=None) -> None:
         super().__init__(parent)
-        self.ai = ai
-        self.state = state
+        self._ai = ai
+        self._state = state
         self._abort = threading.Event()
-
-    def abort(self) -> None:
-        """Ask the search to stop and discard the result (new game / quit)."""
-        self._abort.set()
+        self.result: Optional[Move] = None
 
     def run(self) -> None:
-        try:
-            move = self.ai.choose_move(
-                self.state,
-                on_info=lambda d, s, n: self.search_info.emit(d, s, n),
-                abort_event=self._abort,
-            )
-            # An aborted worker's result is stale by definition (a new game
-            # or quit superseded it) — never emit it into the GUI.
-            if not self._abort.is_set():
-                self.move_chosen.emit(move)
-        except Exception as exc:  # pragma: no cover - safety net
-            if not self._abort.is_set():
-                self.error.emit(str(exc))
+        pos = FastPosition.from_game_state(self._state)
+        searcher = Searcher(
+            self._ai.config,
+            abort_event=self._abort,
+            info_callback=self._on_info,
+        )
+        result = searcher.search(pos)
+        if self._abort.is_set():
+            return
+        best = result.best_move
+        if best == 0:
+            legal = pos.legal_moves()
+            if not legal:
+                return  # terminal position; the GUI's game-over check handles it
+            best = legal[0]
+        self.result = to_model_move(best)
+        self.result_ready.emit(self.result)
+
+    def abort(self) -> None:
+        """Ask the search to stop promptly; ``run`` then returns nothing."""
+        self._abort.set()
+
+    def _on_info(self, depth: int, score: int, nodes: int) -> None:
+        if not self._abort.is_set():
+            self.search_info.emit(depth, score, nodes)

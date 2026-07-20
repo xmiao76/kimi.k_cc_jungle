@@ -1,22 +1,22 @@
 # Python
 __pycache__/
-*.pyc
-.coverage
-htmlcov/
-
-# Virtual environment
+*.py[cod]
+*.egg-info/
 .venv/
 
-# Build artifacts (do not commit per CLAUDE.md)
+# Tests / coverage
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+
+# PyInstaller
 build/
 dist/
 *.spec
 
-# Packaged release output (regenerate with: python package.py)
+# Release binary (build artifact — never commit)
 release/Jungle.exe
 
-# Tooling caches
-.mypy_cache/
-.pytest_cache/
-/.claude
-*.log
+# Runtime crash log
+jungle-crash.log

@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jungle-game"
 version = "1.0.0"
-description = "Windows desktop Jungle / Dou Shou Qi board game with AI"
+description = "Windows desktop Jungle / Dou Shou Qi board game with built-in AI"
 requires-python = ">=3.11"
 dependencies = [
-    "PyQt6>=6.6",
+    "PySide6>=6.6",
 ]
 
 [project.optional-dependencies]
@@ -17,7 +17,6 @@ dev = [
     "pytest-qt>=4.2",
     "pytest-cov>=4.1",
     "PyInstaller>=6.0",
-    "mypy>=1.7",
 ]
 
 [tool.setuptools.packages.find]
@@ -27,16 +26,10 @@ include = ["jungle*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q -m 'not slow'"
-qt_api = "pyqt6"
+qt_api = "pyside6"
 markers = [
     "slow: long-running strength and performance tests (run with -m slow)",
 ]
 
 [tool.coverage.run]
-omit = ["jungle/engine/legacy_ai.py"]
-
-[tool.mypy]
-python_version = "3.11"
-warn_return_any = true
-warn_unused_configs = true
-ignore_missing_imports = true
+omit = ["jungle/engine/legacy_ai.py", "jungle/engine/v1_frozen.py"]

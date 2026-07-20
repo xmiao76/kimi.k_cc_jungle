@@ -1,349 +1,263 @@
-"""Comprehensive rule tests for the Jungle board model."""
+"""The complete Jungle ruleset, tested rule family by rule family."""
 
 import pytest
 
-from jungle.model.board import Board, GameState, IllegalMoveError, Move, Piece
-from jungle.model.constants import Rank, Side, Terrain, terrain_at
+from jungle.model.board import GameState, Move, Piece
+from jungle.model.constants import Rank, Side
+
+R = Side.RED
+B = Side.BLUE
+
+_DUMMY_SQUARES = [(0, 0), (0, 6), (8, 0), (8, 6), (2, 3), (6, 3)]
 
 
-def _board_with(pieces):
-    rows = [[None for _ in range(7)] for _ in range(9)]
-    for (row, col), piece in pieces.items():
-        rows[row][col] = piece
-    return Board(tuple(tuple(row) for row in rows))
+def state(pieces: dict, side: Side = R) -> GameState:
+    """Custom-position state. A lone army would already have lost by
+    elimination, so a harmless dummy enemy cat is added on a free square
+    whenever one side is missing."""
+    pieces = dict(pieces)
+    for missing in (B, R):
+        if not any(p.side is missing for p in pieces.values()):
+            for square in _DUMMY_SQUARES:
+                if square not in pieces:
+                    pieces[square] = Piece(missing, Rank.CAT)
+                    break
+    return GameState.from_pieces(pieces, current_side=side)
 
 
-def test_standard_rank_capture():
-    board = _board_with({
-        (2, 0): Piece(Side.RED, Rank.LION),
-        (2, 1): Piece(Side.BLUE, Rank.DOG),
+def destinations(game: GameState, pos) -> set:
+    return {m.to_pos for m in game.legal_moves() if m.from_pos == pos}
+
+
+# -- basic movement ---------------------------------------------------------
+
+
+def test_pieces_move_one_step_orthogonally():
+    game = state({(2, 3): Piece(R, Rank.WOLF)})
+    assert destinations(game, (2, 3)) == {(1, 3), (3, 3), (2, 2), (2, 4)}
+
+
+def test_pieces_do_not_move_diagonally():
+    game = state({(2, 3): Piece(R, Rank.WOLF)})
+    for diagonal in ((1, 2), (1, 4), (3, 2), (3, 4)):
+        assert diagonal not in destinations(game, (2, 3))
+
+
+def test_board_edges_limit_movement():
+    game = state({(0, 0): Piece(R, Rank.CAT)})
+    assert destinations(game, (0, 0)) == {(1, 0), (0, 1)}
+
+
+def test_own_pieces_block_movement():
+    game = state({(2, 3): Piece(R, Rank.WOLF), (2, 4): Piece(R, Rank.DOG)})
+    assert (2, 4) not in destinations(game, (2, 3))
+
+
+# -- ordinary captures -------------------------------------------------------
+
+
+def test_capture_equal_or_lower_rank():
+    game = state({
+        (2, 3): Piece(R, Rank.LION),
+        (2, 4): Piece(B, Rank.TIGER),
+        (2, 2): Piece(B, Rank.LION),
     })
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((2, 0), (2, 1)))
+    dests = destinations(game, (2, 3))
+    assert (2, 4) in dests  # lion takes tiger
+    assert (2, 2) in dests  # lion takes lion (equal rank)
 
 
-def test_equal_rank_capture():
-    board = _board_with({
-        (2, 0): Piece(Side.RED, Rank.LION),
-        (2, 1): Piece(Side.BLUE, Rank.LION),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((2, 0), (2, 1)))
+def test_cannot_capture_higher_rank():
+    game = state({(2, 3): Piece(R, Rank.TIGER), (2, 4): Piece(B, Rank.LION)})
+    assert (2, 4) not in destinations(game, (2, 3))
 
 
-def test_weaker_cannot_capture_stronger():
-    board = _board_with({
-        (2, 0): Piece(Side.RED, Rank.DOG),
-        (2, 1): Piece(Side.BLUE, Rank.LION),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((2, 0), (2, 1)))
+# -- river -------------------------------------------------------------------
 
 
-def test_cannot_capture_own_piece():
-    board = _board_with({
-        (4, 3): Piece(Side.RED, Rank.LION),
-        (4, 4): Piece(Side.RED, Rank.DOG),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((4, 3), (4, 4)))
+def test_only_rat_enters_river():
+    game = state({(3, 0): Piece(R, Rank.DOG), (6, 0): Piece(R, Rank.RAT)})
+    assert (3, 1) not in destinations(game, (3, 0))  # dog barred from river
+    assert (6, 1) in destinations(game, (6, 0))  # rat enters from land
 
 
-def test_rat_captures_elephant_only_on_land():
-    board = _board_with({
-        (2, 0): Piece(Side.RED, Rank.RAT),
-        (2, 1): Piece(Side.BLUE, Rank.ELEPHANT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((2, 0), (2, 1)))
+def test_rat_swims_within_river_and_exits_to_land():
+    game = state({(4, 2): Piece(R, Rank.RAT)})
+    dests = destinations(game, (4, 2))
+    assert (4, 1) in dests and (5, 2) in dests  # river-to-river
+    assert (4, 3) in dests  # exit to land
 
 
-def test_rat_cannot_capture_elephant_from_water():
-    board = _board_with({
-        (3, 1): Piece(Side.RED, Rank.RAT),
-        (3, 2): Piece(Side.BLUE, Rank.ELEPHANT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((3, 1), (3, 2)))
+def test_river_rat_cannot_capture_land_piece():
+    game = state({(3, 1): Piece(B, Rank.RAT), (3, 0): Piece(R, Rank.ELEPHANT)}, side=B)
+    assert (3, 0) not in destinations(game, (3, 1))
 
 
-def test_rat_moves_in_river():
-    board = _board_with({(3, 1): Piece(Side.RED, Rank.RAT)})
-    state = GameState(board=board, current_side=Side.RED)
-    # Can move to adjacent river squares.
-    assert state.is_legal_move(Move((3, 1), (3, 2)))
-    assert state.is_legal_move(Move((3, 1), (4, 1)))
+def test_land_piece_cannot_capture_river_rat():
+    # A land rat may not take a swimming rat either (no land<->river capture).
+    game = state({(3, 0): Piece(R, Rank.RAT), (3, 1): Piece(B, Rank.RAT)})
+    assert (3, 1) not in destinations(game, (3, 0))
 
 
-def test_rat_can_leave_river():
-    board = _board_with({(3, 1): Piece(Side.RED, Rank.RAT)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((3, 1), (2, 1)))
+def test_river_rat_captures_river_rat():
+    game = state({(4, 1): Piece(R, Rank.RAT), (4, 2): Piece(B, Rank.RAT)})
+    assert (4, 2) in destinations(game, (4, 1))
 
 
-def test_non_rat_cannot_enter_river():
-    for rank in (Rank.CAT, Rank.DOG, Rank.WOLF, Rank.LEOPARD, Rank.TIGER, Rank.LION, Rank.ELEPHANT):
-        board = _board_with({(2, 1): Piece(Side.RED, rank)})
-        state = GameState(board=board, current_side=Side.RED)
-        assert not state.is_legal_move(Move((2, 1), (3, 1))), f"{rank} should not enter river"
+# -- rat <-> elephant ---------------------------------------------------------
 
 
-def test_lion_horizontal_jump_over_left_river():
-    board = _board_with({(4, 0): Piece(Side.RED, Rank.LION)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((4, 0), (4, 3)))
+def test_rat_captures_elephant_from_land():
+    game = state({(2, 3): Piece(R, Rank.RAT), (2, 4): Piece(B, Rank.ELEPHANT)})
+    assert (2, 4) in destinations(game, (2, 3))
 
 
-def test_lion_horizontal_jump_over_right_river():
-    board = _board_with({(4, 6): Piece(Side.RED, Rank.LION)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((4, 6), (4, 3)))
+def test_elephant_cannot_capture_rat():
+    game = state({(2, 3): Piece(R, Rank.ELEPHANT), (2, 4): Piece(B, Rank.RAT)})
+    assert (2, 4) not in destinations(game, (2, 3))
 
 
-def test_tiger_horizontal_jump():
-    board = _board_with({(4, 0): Piece(Side.RED, Rank.TIGER)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((4, 0), (4, 3)))
-
-
-def test_tiger_vertical_jump_is_illegal():
-    board = _board_with({(6, 1): Piece(Side.RED, Rank.TIGER)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((6, 1), (2, 1)))
+def test_elephant_cannot_capture_rat_even_in_trap():
+    # The elephant/rat restriction overrides the trap's rank-0 defense.
+    game = state({(7, 2): Piece(R, Rank.ELEPHANT), (7, 3): Piece(B, Rank.RAT)})
+    assert (7, 3) not in destinations(game, (7, 2))
 
-
-def test_tiger_vertical_jump_up_is_illegal():
-    board = _board_with({(2, 1): Piece(Side.RED, Rank.TIGER)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((2, 1), (6, 1)))
-
-
-def test_tiger_horizontal_jump_blocked_by_rat():
-    board = _board_with({
-        (4, 0): Piece(Side.RED, Rank.TIGER),
-        (4, 2): Piece(Side.BLUE, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((4, 0), (4, 3)))
-
-
-def test_tiger_horizontal_jump_capture():
-    board = _board_with({
-        (4, 6): Piece(Side.RED, Rank.TIGER),
-        (4, 3): Piece(Side.BLUE, Rank.WOLF),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((4, 6), (4, 3)))
-
-
-def test_lion_vertical_jump():
-    board = _board_with({(2, 1): Piece(Side.RED, Rank.LION)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((2, 1), (6, 1)))
-
-
-def test_jump_blocked_by_friendly_rat():
-    board = _board_with({
-        (2, 1): Piece(Side.RED, Rank.LION),
-        (4, 1): Piece(Side.RED, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((2, 1), (6, 1)))
-
-
-def test_jump_blocked_by_enemy_rat():
-    board = _board_with({
-        (2, 1): Piece(Side.RED, Rank.LION),
-        (4, 1): Piece(Side.BLUE, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((2, 1), (6, 1)))
-
-
-def test_jump_captures_on_landing():
-    board = _board_with({
-        (2, 1): Piece(Side.RED, Rank.LION),
-        (6, 1): Piece(Side.BLUE, Rank.DOG),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((2, 1), (6, 1)))
-
-
-def test_jump_cannot_land_on_stronger_piece():
-    board = _board_with({
-        (2, 1): Piece(Side.RED, Rank.LION),
-        (6, 1): Piece(Side.BLUE, Rank.ELEPHANT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((2, 1), (6, 1)))
-
-
-def test_trap_reduces_defender_rank():
-    board = _board_with({
-        (7, 3): Piece(Side.BLUE, Rank.ELEPHANT),
-        (8, 3): Piece(Side.RED, Rank.RAT),
-    })
-    # Blue elephant is in red trap at (7,3). Red rat at (8,3) adjacent.
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((8, 3), (7, 3)))
-
-
-def test_trapped_piece_can_attack_out():
-    board = _board_with({
-        (7, 3): Piece(Side.BLUE, Rank.RAT),
-        (7, 2): Piece(Side.RED, Rank.ELEPHANT),
-    })
-    # Blue rat is in red trap at (7,3); the red elephant is also in a red trap
-    # at (7,2), so its defensive rank is 0 and the rat can capture it.
-    state = GameState(board=board, current_side=Side.BLUE)
-    assert state.is_legal_move(Move((7, 3), (7, 2)))
-
-
-def test_own_trap_does_not_reduce_rank():
-    board = _board_with({
-        (0, 2): Piece(Side.BLUE, Rank.ELEPHANT),
-        (0, 1): Piece(Side.RED, Rank.LION),
-    })
-    # Blue elephant is in own trap; red lion (7) still cannot capture it (8).
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((0, 1), (0, 2)))
-
-
-def test_rat_captures_elephant_in_own_trap():
-    # The rat's special capture of the elephant ignores rank; an own-trap
-    # square gives the elephant no extra protection.
-    board = _board_with({
-        (0, 2): Piece(Side.BLUE, Rank.ELEPHANT),
-        (0, 1): Piece(Side.RED, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((0, 1), (0, 2)))
-
-
-def test_cannot_move_into_own_den():
-    board = _board_with({(8, 3): Piece(Side.RED, Rank.RAT)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((8, 3), (8, 3)))
-
-
-def test_moving_into_opponent_den_wins():
-    board = _board_with({(1, 3): Piece(Side.RED, Rank.RAT)})
-    state = GameState(board=board, current_side=Side.RED)
-    new_state = state.after_move(Move((1, 3), (0, 3)))
-    assert new_state.winner is Side.RED
-
-
-def test_win_by_eliminating_all_enemy_pieces():
-    board = _board_with({
-        (2, 0): Piece(Side.RED, Rank.LION),
-        (2, 1): Piece(Side.BLUE, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    new_state = state.after_move(Move((2, 0), (2, 1)))
-    assert new_state.winner is Side.RED
-
-
-def test_stalemate_no_legal_moves():
-    # Red rat is boxed in by stronger enemy pieces; no other red pieces exist.
-    board = _board_with({
-        (0, 0): Piece(Side.RED, Rank.RAT),
-        (0, 1): Piece(Side.BLUE, Rank.CAT),
-        (1, 0): Piece(Side.BLUE, Rank.DOG),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.legal_moves() == []
-
-
-def test_after_move_switches_side():
-    state = GameState(board=Board.starting(), current_side=Side.RED)
-    move = Move((8, 0), (7, 0))
-    new_state = state.after_move(move)
-    assert new_state.current_side is Side.BLUE
-
-
-def test_illegal_move_raises():
-    state = GameState(board=Board.starting(), current_side=Side.RED)
-    with pytest.raises(IllegalMoveError):
-        state.after_move(Move((8, 0), (8, 0)))
-
-
-def test_moving_after_game_over_raises():
-    board = _board_with({(0, 3): Piece(Side.RED, Rank.RAT)})
-    state = GameState(board=board, current_side=Side.RED, winner=Side.RED)
-    with pytest.raises(IllegalMoveError):
-        state.after_move(Move((0, 3), (0, 2)))
-
-
-def test_board_empty_has_no_pieces():
-    board = Board.empty()
-    for pos in board.positions():
-        assert board.piece_at(pos) is None
-
-
-def test_board_invalid_dimensions_raise():
-    with pytest.raises(ValueError):
-        Board(((None, None), (None, None)))
-
-
-def test_rat_in_water_cannot_capture_elephant_on_land():
-    board = _board_with({
-        (3, 1): Piece(Side.RED, Rank.RAT),
-        (2, 1): Piece(Side.BLUE, Rank.ELEPHANT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((3, 1), (2, 1)))
-
-
-def test_rat_in_water_cannot_capture_rat_on_land():
-    board = _board_with({
-        (3, 1): Piece(Side.RED, Rank.RAT),
-        (2, 1): Piece(Side.BLUE, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((3, 1), (2, 1)))
-
-
-def test_rat_on_land_cannot_capture_rat_in_water():
-    board = _board_with({
-        (2, 1): Piece(Side.RED, Rank.RAT),
-        (3, 1): Piece(Side.BLUE, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((2, 1), (3, 1)))
-
-
-def test_rat_in_water_captures_rat_in_water():
-    board = _board_with({
-        (3, 1): Piece(Side.RED, Rank.RAT),
-        (3, 2): Piece(Side.BLUE, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((3, 1), (3, 2)))
-
-
-def test_rat_on_land_captures_rat_on_land():
-    board = _board_with({
-        (2, 1): Piece(Side.RED, Rank.RAT),
-        (2, 2): Piece(Side.BLUE, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((2, 1), (2, 2)))
-
-
-def test_wolf_outranks_dog():
-    # Wikipedia ranking: dog 3, wolf 4.
-    board = _board_with({
-        (2, 0): Piece(Side.RED, Rank.WOLF),
-        (2, 1): Piece(Side.BLUE, Rank.DOG),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((2, 0), (2, 1)))
-
-
-def test_dog_cannot_capture_wolf():
-    board = _board_with({
-        (2, 0): Piece(Side.RED, Rank.DOG),
-        (2, 1): Piece(Side.BLUE, Rank.WOLF),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((2, 0), (2, 1)))
+
+# -- lion and tiger river jumps ----------------------------------------------
+
+
+def test_lion_jumps_horizontally_both_ways():
+    game = state({(3, 3): Piece(R, Rank.LION)})
+    dests = destinations(game, (3, 3))
+    assert (3, 0) in dests and (3, 6) in dests
+    # Steps into the river itself are still forbidden.
+    assert (3, 2) not in dests and (3, 4) not in dests
+
+
+def test_lion_jumps_vertically():
+    game = state({(6, 1): Piece(R, Rank.LION)})
+    assert (2, 1) in destinations(game, (6, 1))
+    game_blue = state({(2, 5): Piece(B, Rank.LION)}, side=B)
+    assert (6, 5) in destinations(game_blue, (2, 5))
+
+
+def test_tiger_jumps_horizontally_only():
+    game = state({(3, 3): Piece(R, Rank.TIGER)})
+    dests = destinations(game, (3, 3))
+    assert (3, 0) in dests and (3, 6) in dests
+
+
+def test_tiger_must_not_jump_vertically():
+    # Locked variant: the tiger is barred from the 3-cell vertical jump.
+    game = state({(6, 1): Piece(R, Rank.TIGER)})
+    assert (2, 1) not in destinations(game, (6, 1))
+    game_blue = state({(2, 4): Piece(B, Rank.TIGER)}, side=B)
+    assert (6, 4) not in destinations(game_blue, (2, 4))
+
+
+def test_any_rat_blocks_jumps_either_side():
+    # Enemy rat in the river blocks the lion's vertical jump.
+    game = state({(6, 1): Piece(R, Rank.LION), (4, 1): Piece(B, Rank.RAT)})
+    assert (2, 1) not in destinations(game, (6, 1))
+    # Friendly rat blocks it too.
+    game = state({(6, 1): Piece(R, Rank.LION), (5, 1): Piece(R, Rank.RAT)})
+    assert (2, 1) not in destinations(game, (6, 1))
+    # And a river rat blocks the horizontal jump.
+    game = state({(3, 0): Piece(R, Rank.LION), (3, 2): Piece(B, Rank.RAT)})
+    assert (3, 3) not in destinations(game, (3, 0))
+
+
+def test_jump_may_capture_on_landing():
+    game = state({(3, 3): Piece(R, Rank.LION), (3, 6): Piece(B, Rank.DOG)})
+    assert (3, 6) in destinations(game, (3, 3))
+
+
+def test_jump_cannot_capture_higher_rank_on_landing():
+    game = state({(3, 3): Piece(R, Rank.LION), (3, 0): Piece(B, Rank.ELEPHANT)})
+    assert (3, 0) not in destinations(game, (3, 3))
+
+
+def test_jump_landing_on_own_piece_is_blocked():
+    game = state({(3, 3): Piece(R, Rank.TIGER), (3, 0): Piece(R, Rank.CAT)})
+    assert (3, 0) not in destinations(game, (3, 3))
+
+
+# -- traps -------------------------------------------------------------------
+
+
+def test_piece_in_opponent_trap_defends_with_rank_zero():
+    # A blue lion standing in a red trap can be taken even by the rat.
+    game = state({(7, 3): Piece(B, Rank.LION), (7, 2): Piece(R, Rank.RAT)})
+    assert (7, 3) in destinations(game, (7, 2))
+
+
+def test_piece_in_opponent_trap_still_attacks_with_normal_rank():
+    game = state({(7, 3): Piece(B, Rank.LION), (7, 2): Piece(R, Rank.TIGER)}, side=B)
+    assert (7, 2) in destinations(game, (7, 3))
+
+
+def test_piece_in_own_trap_defends_normally():
+    # Red lion in red's own trap is NOT weakened; the blue rat cannot take it.
+    game = state({(7, 3): Piece(R, Rank.LION), (7, 2): Piece(B, Rank.RAT)}, side=B)
+    assert (7, 3) not in destinations(game, (7, 2))
+
+
+# -- dens and winning ----------------------------------------------------------
+
+
+def test_cannot_enter_own_den():
+    game = state({(8, 2): Piece(R, Rank.RAT), (7, 3): Piece(R, Rank.DOG)})
+    assert (8, 3) not in destinations(game, (8, 2))
+    assert (8, 3) not in destinations(game, (7, 3))
+
+
+def test_entering_opponent_den_wins():
+    game = state({(1, 3): Piece(R, Rank.RAT), (5, 5): Piece(B, Rank.DOG)})
+    assert (0, 3) in destinations(game, (1, 3))
+    new_game = game.apply_move(Move((1, 3), (0, 3)))
+    assert new_game.winner is R
+    assert new_game.game_over_reason == "den"
+    assert new_game.is_game_over
+
+
+def test_capturing_all_enemy_pieces_wins():
+    game = state({(2, 3): Piece(R, Rank.DOG), (2, 4): Piece(B, Rank.CAT)})
+    new_game = game.apply_move(Move((2, 3), (2, 4)))
+    assert new_game.winner is R
+    assert new_game.game_over_reason == "elimination"
+
+
+def test_side_with_no_legal_moves_loses():
+    # Blue rat is cornered by the red lion and tiger and has no moves.
+    game = state(
+        {
+            (0, 0): Piece(B, Rank.RAT),
+            (1, 0): Piece(R, Rank.LION),
+            (0, 1): Piece(R, Rank.TIGER),
+        },
+        side=B,
+    )
+    assert game.winner is R
+    assert game.game_over_reason == "no_moves"
+    assert game.legal_moves() == ()
+
+
+def test_no_moves_loss_after_applied_move():
+    game = state(
+        {
+            (0, 0): Piece(B, Rank.RAT),
+            (1, 0): Piece(R, Rank.LION),
+            (0, 1): Piece(R, Rank.TIGER),
+            (5, 5): Piece(R, Rank.DOG),
+        }
+    )
+    new_game = game.apply_move(Move((5, 5), (5, 6)))
+    assert new_game.winner is R
+    assert new_game.game_over_reason == "no_moves"
+
+
+def test_game_not_over_at_start(initial_state):
+    assert initial_state.winner is None
+    assert not initial_state.is_draw
+    assert not initial_state.is_game_over
+    assert initial_state.game_over_reason is None

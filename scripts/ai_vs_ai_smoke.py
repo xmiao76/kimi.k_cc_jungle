@@ -1,46 +1,54 @@
-"""Headless AI-vs-AI full-game smoke test (offscreen Qt platform).
+"""Headless full-game smoke test: plays a complete AI-vs-AI game offscreen.
 
-Runs a complete self-play game through the real MainWindow/AIWorker stack
-and prints GAME_OVER on success. Used by tests and as a manual sanity check.
+Run as a SUBPROCESS (never inside pytest's process): long in-process Qt
+self-play sessions crash intermittently on Windows (0x8001010d). This script
+drives the real MainWindow/AIWorker machinery at high speed and prints the
+result.
+
+Usage: python scripts/ai_vs_ai_smoke.py [timeout_seconds] [--ai-first-equivalent]
+Exit code 0 = a game completed; 1 = timeout / no result.
 """
+
+from __future__ import annotations
 
 import os
 import sys
 import time
-from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PyQt6.QtCore import QEventLoop  # noqa: E402
-from PyQt6.QtWidgets import QApplication  # noqa: E402
-
-from jungle.gui.main_window import MainWindow  # noqa: E402
+from PySide6.QtCore import QElapsedTimer
+from PySide6.QtWidgets import QApplication
 
 
 def main() -> int:
-    timeout_s = int(sys.argv[1]) if len(sys.argv) > 1 else 110
-    app = QApplication(sys.argv)
-    window = MainWindow(ai_vs_ai=True, ai_depth=2, time_limit=0.05)
-    deadline = time.monotonic() + timeout_s
-    while window._game_over_dialog is None and time.monotonic() < deadline:
-        app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
+    timeout_s = float(sys.argv[1]) if len(sys.argv) > 1 else 110.0
+    app = QApplication(sys.argv[:1])
+
+    from jungle.gui.main_window import MainWindow
+
+    window = MainWindow(ai_vs_ai=True, ai_depth=2, time_limit=0.05, strength="easy")
+    window.show()
+
+    timer = QElapsedTimer()
+    timer.start()
+    while window._game_over_dialog is None and timer.elapsed() < timeout_s * 1000:
+        app.processEvents()
+        time.sleep(0.005)
+
     if window._game_over_dialog is None:
-        print("TIMEOUT: AI-vs-AI game did not complete")
+        print(f"TIMEOUT after {timeout_s:.0f}s: plies={window._state.move_count}")
+        window._abort_ai()
         return 1
-    state = window._board_view.state()
-    assert state is not None
-    if state.winner is not None:
-        result = f"{state.winner.name} wins"
-    elif state.draw:
-        result = "draw"
-    else:
-        result = "unknown"
-    print(f"GAME_OVER: {result} plies={state.move_count}")
-    window._game_over_dialog.reject()
+
+    state = window._state
+    winner = state.winner
+    outcome = winner.name if winner is not None else "DRAW"
+    print(f"GAME_OVER: {outcome} reason={state.game_over_reason} plies={state.move_count}")
     window._abort_ai()
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

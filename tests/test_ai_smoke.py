@@ -1,44 +1,43 @@
-"""Smoke tests for the AI engine."""
+"""Smoke tests for the public AI interface and difficulty presets."""
 
-from jungle.engine.ai import AI
-from jungle.model.board import Board, GameState, Move
+import pytest
+
+from jungle.engine.ai import AI, STRENGTH_NAMES, NoLegalMoveError
+from jungle.model.board import GameState, Piece
 from jungle.model.constants import Rank, Side
 
 
-def _board_with(pieces):
-    rows = [[None for _ in range(7)] for _ in range(9)]
-    for (row, col), piece in pieces.items():
-        rows[row][col] = piece
-    return Board(tuple(tuple(row) for row in rows))
+@pytest.mark.parametrize("strength", STRENGTH_NAMES)
+def test_ai_returns_a_legal_move_at_every_strength(strength, initial_state):
+    ai = AI(strength=strength)
+    move, result = ai.choose_move(initial_state)
+    assert move in initial_state.legal_moves()
+    assert result.depth >= 1
+    assert result.nodes > 0
 
 
-def test_ai_chooses_legal_move():
-    state = GameState(board=Board.starting(), current_side=Side.RED)
-    ai = AI(side=Side.RED, depth=2)
-    move = ai.choose_move(state)
-    assert move is not None
-    assert state.is_legal_move(move)
+def test_ai_rejects_unknown_strength():
+    with pytest.raises(ValueError):
+        AI(strength="grandmaster")
 
 
-def test_ai_prefers_capture():
-    from jungle.model.board import Piece
-    board = _board_with({
-        (2, 0): Piece(Side.RED, Rank.LION),
-        (2, 1): Piece(Side.BLUE, Rank.RAT),
-        (2, 2): Piece(Side.BLUE, Rank.CAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    ai = AI(side=Side.RED, depth=4)
-    move = ai.choose_move(state)
-    assert move is not None
-    assert state.is_legal_move(move)
-    # The lion has capture moves available; a good AI should not pass them up
-    # indefinitely, but exact tie-breaking depends on search depth and evaluation.
-    # We verify only that the chosen move is legal and improves or holds material.
+def test_ai_raises_on_terminal_position():
+    state = GameState.from_pieces({(2, 2): Piece(Side.BLUE, Rank.CAT)}, current_side=Side.RED)
+    assert state.is_game_over
+    with pytest.raises(NoLegalMoveError):
+        AI(strength="easy").choose_move(state)
 
 
-def test_ai_handles_no_moves():
-    board = Board.empty()
-    state = GameState(board=board, current_side=Side.RED)
-    ai = AI(side=Side.RED, depth=2)
-    assert ai.choose_move(state) is None
+def test_depth_and_time_overrides_apply():
+    ai = AI(strength="easy", depth=5, time_limit=2.0)
+    assert ai.config.max_depth == 5
+    assert ai.config.soft_limit_s == 2.0
+    assert ai.config.hard_limit_s == 5.0
+
+
+def test_ai_plays_convincingly_for_both_sides(initial_state):
+    ai = AI(strength="medium", depth=2, time_limit=1.0)
+    red_move, _ = ai.choose_move(initial_state)
+    blue_state = initial_state.apply_move(red_move)
+    blue_move, _ = ai.choose_move(blue_state)
+    assert blue_move in blue_state.legal_moves()

@@ -1,58 +1,63 @@
-"""Application-wide styles and theme constants."""
+"""Application stylesheet."""
 
-from __future__ import annotations
-
-from PyQt6.QtGui import QColor
-
-WINDOW_BACKGROUND = QColor("#2c3e50")
-STATUS_BACKGROUND = QColor("#34495e")
-STATUS_FOREGROUND = QColor("#ecf0f1")
-BUTTON_BACKGROUND = QColor("#3498db")
-BUTTON_FOREGROUND = QColor("#ffffff")
-
-MAIN_WINDOW_QSS = """
-QMainWindow {
-    background-color: #2c3e50;
+APP_QSS = """
+QMainWindow, QDialog {
+    background: #2b2b30;
+}
+QWidget {
+    color: #ececf1;
+    font-family: "Segoe UI";
+    font-size: 10pt;
 }
 QMenuBar {
-    background-color: #34495e;
-    color: #ecf0f1;
+    background: #1f1f23;
+    border-bottom: 1px solid #3a3a41;
 }
-QMenuBar::item:selected {
-    background-color: #3498db;
+QMenuBar::item {
+    padding: 4px 12px;
+    background: transparent;
+}
+QMenuBar::item:selected, QMenu::item:selected {
+    background: #3d6fa8;
 }
 QMenu {
-    background-color: #34495e;
-    color: #ecf0f1;
+    background: #232328;
+    border: 1px solid #3a3a41;
 }
-QMenu::item:selected {
-    background-color: #3498db;
+QMenu::item {
+    padding: 5px 24px;
 }
 QStatusBar {
-    background-color: #34495e;
-    color: #ecf0f1;
-}
-QPushButton {
-    background-color: #3498db;
-    color: #ffffff;
-    border: none;
-    padding: 8px 16px;
-    border-radius: 4px;
-    font-weight: bold;
-}
-QPushButton:hover {
-    background-color: #2980b9;
-}
-QPushButton:pressed {
-    background-color: #1c6ea4;
-}
-QDialog {
-    background-color: #2c3e50;
+    background: #1f1f23;
+    border-top: 1px solid #3a3a41;
+    font-size: 10pt;
 }
 QLabel {
-    color: #ecf0f1;
+    padding: 2px;
 }
-QRadioButton {
-    color: #ecf0f1;
+QPushButton {
+    background: #3d6fa8;
+    border: 1px solid #2c527d;
+    border-radius: 4px;
+    padding: 6px 18px;
+    min-width: 72px;
+}
+QPushButton:hover {
+    background: #4a80bd;
+}
+QPushButton:pressed {
+    background: #2c527d;
+}
+QComboBox {
+    background: #38383f;
+    border: 1px solid #4a4a52;
+    border-radius: 3px;
+    padding: 4px 8px;
+    min-width: 140px;
+}
+QComboBox QAbstractItemView {
+    background: #232328;
+    border: 1px solid #4a4a52;
+    selection-background-color: #3d6fa8;
 }
 """

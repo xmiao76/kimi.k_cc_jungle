@@ -1,326 +1,237 @@
-"""Main application window."""
+"""Main window: wires the board view, game state, AI worker, and menus."""
 
 from __future__ import annotations
 
-from PyQt6.QtGui import QAction, QKeySequence
-from PyQt6.QtWidgets import (
-    QDialog,
-    QMainWindow,
-    QMessageBox,
-    QStatusBar,
-    QWidget,
-)
+from typing import Optional
+
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+from PySide6.QtWidgets import QLabel, QMainWindow, QWidget
 
 from jungle.engine.ai import AI, AIWorker
 from jungle.gui.board_view import BoardView
 from jungle.gui.dialogs import (
-    DIFFICULTY_MEDIUM,
     MODE_AI_VS_AI,
     MODE_HUMAN_VS_AI,
     GameOverDialog,
     NewGameDialog,
 )
-from jungle.gui.styles import MAIN_WINDOW_QSS
-from jungle.model.board import Board, GameState, IllegalMoveError, Move
+from jungle.model.board import MAX_PLIES, GameState, Move
 from jungle.model.constants import Side
 
-# Difficulty presets: name -> (max search depth, soft time limit per move).
-DIFFICULTY_PRESETS: dict[str, tuple[int, float]] = {
-    "easy": (3, 0.5),
-    "medium": (6, 1.5),
-    "hard": (12, 2.5),
+_WIN_REASONS = {
+    "den": "entered the enemy den ★",
+    "elimination": "captured all enemy pieces",
+    "no_moves": "the opponent has no legal moves",
 }
-
-_SIDE_NAMES = {Side.RED: "RED", Side.BLUE: "BLUE"}
+_DRAW_REASONS = {
+    "repetition": "threefold repetition",
+    "move_limit": f"{MAX_PLIES} plies without a result",
+}
 
 
 class MainWindow(QMainWindow):
-    """The main Jungle game window."""
-
     def __init__(
         self,
         ai_first: bool = False,
-        ai_depth: int | None = None,
+        ai_depth: Optional[int] = None,
         flipped: bool = False,
-        strength: str = DIFFICULTY_MEDIUM,
-        time_limit: float | None = None,
+        strength: str = "medium",
+        time_limit: Optional[float] = None,
         ai_vs_ai: bool = False,
-        parent: QWidget | None = None,
+        parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Jungle / Dou Shou Qi")
-        self.setStyleSheet(MAIN_WINDOW_QSS)
-        self.resize(640, 800)
+        self.setWindowTitle("Jungle — Dou Shou Qi 鬥獸棋")
 
-        self._strength = strength if strength in DIFFICULTY_PRESETS else DIFFICULTY_MEDIUM
+        self._strength = strength
         self._ai_depth = ai_depth
         self._time_limit = time_limit
-        self._mode = MODE_AI_VS_AI if ai_vs_ai else MODE_HUMAN_VS_AI
-        self._human_side = Side.BLUE if ai_first else Side.RED
-        self._ai_side = Side.RED if ai_first else Side.BLUE
-        self._ai = self._make_ai()
-        self._ai_worker: AIWorker | None = None
-        self._ai_thinking = False
-        self._generation = 0
-        self._game_over_dialog: GameOverDialog | None = None
+        self._ai = AI(strength=strength, depth=ai_depth, time_limit=time_limit)
+
+        self._state = GameState.starting()
+        self._human_side: Optional[Side] = None if ai_vs_ai else (Side.BLUE if ai_first else Side.RED)
+        self._worker: Optional[AIWorker] = None
+        self._game_over_dialog: Optional[GameOverDialog] = None
 
         self._board_view = BoardView(self)
-        self._board_view.move_requested.connect(self._on_human_move)
-        self._board_view.status_message.connect(self._show_status)
+        self._board_view.set_flipped(flipped)
         self.setCentralWidget(self._board_view)
 
-        self._status_bar = QStatusBar(self)
-        self.setStatusBar(self._status_bar)
+        self._turn_label = QLabel()
+        self._ai_info_label = QLabel()
+        self.statusBar().addWidget(self._turn_label, 1)
+        self.statusBar().addPermanentWidget(self._ai_info_label)
 
-        self._setup_menu()
-        self._start_new_game(flipped=flipped)
+        self._build_menus()
+        self._board_view.move_requested.connect(self._on_move_requested)
+        self._board_view.status_message.connect(self._on_status_message)
+        self._board_view.set_state(self._state)
+        self.resize(640, 780)
 
-    # ------------------------------------------------------------------
-    # Setup
-    # ------------------------------------------------------------------
+        # Covers AI-first / AI-vs-AI: the AI may already be on move.
+        self._maybe_start_ai()
 
-    def _make_ai(self) -> AI:
-        depth, limit = DIFFICULTY_PRESETS[self._strength]
-        if self._ai_depth is not None:
-            depth = self._ai_depth
-        if self._time_limit is not None:
-            limit = self._time_limit
-        return AI(self._ai_side, depth=depth, time_limit_s=limit)
+    # -- menus ----------------------------------------------------------------
 
-    def _setup_menu(self) -> None:
-        menu_bar = self.menuBar()
-        if menu_bar is None:
-            return
-
-        game_menu = menu_bar.addMenu("Game")
-        if game_menu is None:
-            return
-
-        new_action = QAction("New Game...", self)
+    def _build_menus(self) -> None:
+        game_menu = self.menuBar().addMenu("&Game")
+        new_action = QAction("&New Game…", self)
         new_action.setShortcut(QKeySequence.StandardKey.New)
         new_action.triggered.connect(self._prompt_new_game)
         game_menu.addAction(new_action)
-
-        flip_action = QAction("Flip Board", self)
-        flip_action.setShortcut("Ctrl+F")
-        flip_action.triggered.connect(self._toggle_flip)
-        game_menu.addAction(flip_action)
-
         game_menu.addSeparator()
-
-        quit_action = QAction("Quit", self)
+        quit_action = QAction("&Quit", self)
         quit_action.setShortcut(QKeySequence.StandardKey.Quit)
         quit_action.triggered.connect(self.close)
         game_menu.addAction(quit_action)
 
-        help_menu = menu_bar.addMenu("Help")
-        if help_menu is None:
+        view_menu = self.menuBar().addMenu("&View")
+        self._flip_action = QAction("&Flip Board", self, checkable=True)
+        self._flip_action.setShortcut("Ctrl+F")
+        self._flip_action.setChecked(self._board_view.is_flipped())
+        self._flip_action.toggled.connect(self._on_flip_toggled)
+        view_menu.addAction(self._flip_action)
+
+        ai_menu = self.menuBar().addMenu("&AI")
+        group = QActionGroup(self)
+        for name in ("easy", "medium", "hard"):
+            action = QAction(name.capitalize(), self, checkable=True)
+            action.setChecked(name == self._strength)
+            action.triggered.connect(lambda checked, n=name: self._on_strength_changed(n))
+            group.addAction(action)
+            ai_menu.addAction(action)
+
+    # -- game flow --------------------------------------------------------------
+
+    def _maybe_start_ai(self) -> None:
+        if self._worker is not None:
+            return  # an AI worker is already thinking; never run two at once
+        if self._state.is_game_over:
+            self._show_game_over()
             return
-        about_action = QAction("About", self)
-        about_action.triggered.connect(self._show_about)
-        help_menu.addAction(about_action)
-
-    def _start_new_game(
-        self,
-        ai_first: bool | None = None,
-        flipped: bool | None = None,
-        mode: str | None = None,
-        difficulty: str | None = None,
-    ) -> None:
-        self._abort_ai()
-        self._generation += 1
-
-        if ai_first is not None:
-            self._human_side = Side.BLUE if ai_first else Side.RED
-            self._ai_side = Side.RED if ai_first else Side.BLUE
-        if mode is not None:
-            self._mode = mode
-        if difficulty is not None and difficulty in DIFFICULTY_PRESETS:
-            self._strength = difficulty
-        self._ai = self._make_ai()
-
-        if flipped is not None:
-            self._board_view.set_flipped(flipped)
-
-        state = GameState(board=Board.starting(), current_side=Side.RED)
-        self._board_view.set_state(state)
-        self._board_view.set_last_move(None)
-        if self._game_over_dialog is not None:
-            self._game_over_dialog.close()
-            self._game_over_dialog = None
-        self._update_status()
-
-        if self._ai_turn(state):
-            self._request_ai_move(state)
-
-    def _prompt_new_game(self) -> None:
-        dialog = NewGameDialog(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        human_turn = self._human_side is not None and self._state.current_side is self._human_side
+        self._board_view.set_input_enabled(human_turn)
+        self._update_turn_label(ai_thinking=not human_turn)
+        if human_turn:
             return
-        ai_vs_ai = dialog.mode() == MODE_AI_VS_AI
-        self._start_new_game(
-            ai_first=not dialog.human_first(),
-            mode=dialog.mode(),
-            difficulty=dialog.difficulty(),
-        )
+        worker = AIWorker(self._ai, self._state, parent=self)
+        worker.result_ready.connect(self._on_ai_result)
+        worker.search_info.connect(self._on_search_info)
+        self._worker = worker
+        self._ai_info_label.setText("")
+        worker.start()
 
-    def _toggle_flip(self) -> None:
-        self._board_view.set_flipped(not self._board_view._flipped)
-        self._update_status()
-
-    # ------------------------------------------------------------------
-    # Move flow
-    # ------------------------------------------------------------------
-
-    def _ai_turn(self, state: GameState) -> bool:
-        if self._mode == MODE_AI_VS_AI:
-            return True
-        return state.current_side is self._ai_side
-
-    def _on_human_move(self, move: Move) -> None:
-        if self._mode == MODE_AI_VS_AI or self._ai_thinking:
+    def _on_move_requested(self, move: Move) -> None:
+        if self._worker is not None:
+            return  # AI is thinking; input should already be disabled
+        if self._human_side is None or self._state.current_side is not self._human_side:
             return
-        state = self._board_view.state()
-        if state is None or state.current_side is not self._human_side:
-            return
+        self._apply_move(move)
+
+    def _on_ai_result(self, move: Move) -> None:
+        worker = self.sender()
+        if worker is not self._worker:
+            return  # stale result from an aborted game
+        self._worker = None
+        worker.deleteLater()
         self._apply_move(move)
 
     def _apply_move(self, move: Move) -> None:
-        state = self._board_view.state()
-        if state is None:
-            return
-        try:
-            new_state = state.after_move(move)
-        except IllegalMoveError as exc:
-            self._show_status(str(exc))
-            return
-
-        self._board_view.set_state(new_state)
-        self._board_view.set_last_move(move)
-        self._update_status()
-
-        if new_state.winner is not None or new_state.draw:
-            self._show_game_over(new_state)
-            return
-
-        if self._ai_turn(new_state):
-            self._request_ai_move(new_state)
-
-    def _request_ai_move(self, state: GameState) -> None:
-        if self._ai_thinking:
-            return
-        self._ai_thinking = True
-        self._show_status(f"AI ({self._strength}) thinking...")
-
-        worker = AIWorker(self._ai, state)
-        worker.setProperty("generation", self._generation)
-        worker.move_chosen.connect(self._on_ai_move_chosen)
-        worker.search_info.connect(self._on_search_info)
-        worker.error.connect(self._on_ai_error)
-        worker.finished.connect(worker.deleteLater)
-        worker.finished.connect(lambda: self._on_worker_finished(worker))
-        self._ai_worker = worker
-        worker.start()
-
-    def _on_worker_finished(self, worker: AIWorker) -> None:
-        # Drop our reference when the current worker is done so we never
-        # touch it after Qt deletes its C++ object (deleteLater above).
-        if self._ai_worker is worker:
-            self._ai_worker = None
-            self._ai_thinking = False
-
-    def _on_ai_move_chosen(self, move: Move | None) -> None:
-        worker = self.sender()
-        self._ai_thinking = False
-        # Identity check first: `is` never touches the C++ object, so this is
-        # safe even if the sender was already deleted by Qt.
-        if worker is not self._ai_worker:
-            return  # stale result from a superseded worker
-        if move is None:
-            self._show_status("AI has no legal moves")
-            return
-        self._apply_move(move)
-
-    def _on_search_info(self, depth: int, score_cp: int, nodes: int) -> None:
-        if self.sender() is not self._ai_worker:
-            return  # stale progress from a superseded worker
-        self._show_status(
-            f"AI ({self._strength}) thinking... d={depth} "
-            f"{score_cp / 100:+.2f} {nodes // 1000}kN"
-        )
-
-    def _on_ai_error(self, message: str) -> None:
-        self._ai_thinking = False
-        self._show_status(f"AI error: {message}")
+        captured = self._state.board.piece_at(move.to_pos) is not None
+        self._state = self._state.apply_move(move)
+        self._board_view.set_state(self._state, last_move=move, last_capture=captured)
+        if self._state.is_game_over:
+            self._board_view.set_input_enabled(False)
+            self._show_game_over()
+        else:
+            self._maybe_start_ai()
 
     def _abort_ai(self) -> None:
-        worker = self._ai_worker
-        # Clear first: any queued signals from the old worker are then
-        # discarded by the identity checks in the slots.
-        self._ai_worker = None
-        self._ai_thinking = False
+        """Stop any running AI worker and wait for it to finish."""
+        worker, self._worker = self._worker, None
         if worker is not None:
-            try:
-                if worker.isRunning():
-                    worker.abort()
-                    worker.wait(2000)
-            except RuntimeError:
-                pass  # Qt already deleted the C++ object (deleteLater)
+            worker.abort()
+            worker.wait(3000)
+            worker.deleteLater()
 
-    # ------------------------------------------------------------------
-    # Status / dialogs
-    # ------------------------------------------------------------------
+    # -- game over --------------------------------------------------------------
 
-    def _update_status(self) -> None:
-        state = self._board_view.state()
-        if state is None:
-            self._show_status("Welcome to Jungle")
-            return
-        if state.winner is not None:
-            self._show_status(f"{self._side_label(state.winner)} wins!")
-            return
-        if state.draw:
-            self._show_status("Draw")
-            return
-        flip = " (flipped)" if self._board_view._flipped else ""
-        if self._mode == MODE_AI_VS_AI:
-            self._show_status(f"AI vs AI — {_SIDE_NAMES[state.current_side]} to move{flip}")
-            return
-        turn = "Human" if state.current_side is self._human_side else "AI"
-        self._show_status(f"Turn: {turn}{flip}")
+    def _game_over_message(self) -> str:
+        winner = self._state.winner
+        reason = self._state.game_over_reason
+        if winner is not None:
+            detail = _WIN_REASONS.get(reason, reason or "")
+            if self._human_side is None:
+                return f"{winner.name} wins — {detail}!"
+            if winner is self._human_side:
+                return f"You win! 🎉 ({detail})"
+            return f"The AI wins — {detail}."
+        detail = _DRAW_REASONS.get(reason, reason or "")
+        return f"Draw — {detail}."
 
-    def _side_label(self, side: Side) -> str:
-        if self._mode == MODE_AI_VS_AI:
-            return f"AI ({_SIDE_NAMES[side]})"
-        return "Human" if side is self._human_side else "AI"
-
-    def _show_game_over(self, state: GameState) -> None:
+    def _show_game_over(self) -> None:
         self._abort_ai()
-        if state.winner is not None:
-            text = f"{self._side_label(state.winner)} wins!"
-        else:
-            text = "Draw"
-        dialog = GameOverDialog(text, self)
-        dialog.accepted.connect(self._prompt_new_game)
-        # Rejecting ("Stay" or the dialog's close button) only dismisses the
-        # dialog — the window and the final position stay open.
-        dialog.finished.connect(self._on_game_over_dialog_finished)
+        self._board_view.set_input_enabled(False)
+        self._turn_label.setText("Game over")
+        self._ai_info_label.setText("")
+        dialog = GameOverDialog(self._game_over_message(), parent=self)
+        dialog.new_game_requested.connect(self._prompt_new_game)
+        dialog.quit_requested.connect(self.close)
         self._game_over_dialog = dialog
-        dialog.open()  # window-modal but non-blocking: the event loop stays alive
+        dialog.show()  # non-modal by design — never exec()
 
-    def _on_game_over_dialog_finished(self, _result: int) -> None:
-        self._game_over_dialog = None
+    # -- slots ------------------------------------------------------------------
 
-    def _show_about(self) -> None:
-        QMessageBox.about(
+    def _prompt_new_game(self) -> None:
+        dialog = NewGameDialog(
             self,
-            "About Jungle",
-            "Jungle / Dou Shou Qi\n\nA Windows desktop board game with AI.\n",
+            mode=MODE_AI_VS_AI if self._human_side is None else MODE_HUMAN_VS_AI,
+            ai_first=self._human_side is Side.BLUE,
+            strength=self._strength,
         )
+        if dialog.exec() != NewGameDialog.DialogCode.Accepted:
+            return
+        self.start_new_game(mode=dialog.mode, ai_first=dialog.ai_first, strength=dialog.strength)
 
-    def _show_status(self, message: str) -> None:
-        self._status_bar.showMessage(message)
-
-    def closeEvent(self, event) -> None:
+    def start_new_game(self, mode: str, ai_first: bool, strength: str) -> None:
+        """Reset everything and start a fresh game (test-friendly entry)."""
         self._abort_ai()
-        event.accept()
+        self._strength = strength
+        self._ai = AI(strength=strength, depth=self._ai_depth, time_limit=self._time_limit)
+        self._state = GameState.starting()
+        self._human_side = None if mode == MODE_AI_VS_AI else (Side.BLUE if ai_first else Side.RED)
+        if self._game_over_dialog is not None:
+            self._game_over_dialog.close()
+            self._game_over_dialog = None
+        self._board_view.set_state(self._state)
+        self._board_view.clear_selection()
+        self._update_turn_label()
+        self._maybe_start_ai()
+
+    def _on_flip_toggled(self, checked: bool) -> None:
+        # Purely a display option: game state, sides, and turn are untouched.
+        self._board_view.set_flipped(checked)
+
+    def _on_strength_changed(self, name: str) -> None:
+        self._strength = name
+        self._ai = AI(strength=name, depth=self._ai_depth, time_limit=self._time_limit)
+
+    def _on_search_info(self, depth: int, score: int, nodes: int) -> None:
+        self._ai_info_label.setText(f"d={depth}  {score / 100:+.2f}  {nodes / 1000:.1f}kN")
+
+    def _on_status_message(self, text: str) -> None:
+        self.statusBar().showMessage(text, 3000)
+
+    def _update_turn_label(self, ai_thinking: bool = False) -> None:
+        side = self._state.current_side
+        who = "RED" if side is Side.RED else "BLUE"
+        if self._human_side is None:
+            self._turn_label.setText(f"AI vs AI — {who} to move" + (" 🤖" if ai_thinking else ""))
+        elif side is self._human_side:
+            self._turn_label.setText(f"Your turn ({who})")
+        else:
+            self._turn_label.setText(f"AI thinking… ({who})")
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        self._abort_ai()
+        super().closeEvent(event)

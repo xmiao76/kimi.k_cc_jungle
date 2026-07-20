@@ -1,4 +1,14 @@
-"""Build a Windows executable with PyInstaller."""
+"""Build the Windows executable with PyInstaller into release/.
+
+Handles Windows quirks: a still-running Jungle.exe locks the release folder
+(killed first), and antivirus/indexer handles can briefly lock freshly
+written files (all deletes/copies retry past PermissionError).
+
+Usage: python package.py
+Output: release/Jungle.exe + release/README.md
+"""
+
+from __future__ import annotations
 
 import os
 import shutil
@@ -9,8 +19,7 @@ from pathlib import Path
 
 
 def _remove_tree(path: Path, attempts: int = 5, delay_s: float = 0.5) -> None:
-    """Remove a directory tree, retrying past transient Windows file locks
-    (antivirus/indexer handles on freshly written executables)."""
+    """Remove a directory tree, retrying past transient Windows file locks."""
     for attempt in range(attempts):
         try:
             if path.exists():
@@ -38,52 +47,55 @@ def main() -> int:
     os.chdir(repo_root)
 
     dist_dir = repo_root / "dist"
+    build_dir = repo_root / "build"
     release_dir = repo_root / "release"
 
     # A previous Jungle.exe still running locks the release folder on Windows.
-    subprocess.run(
-        ["taskkill", "/F", "/IM", "Jungle.exe"],
-        capture_output=True,
-    )
+    subprocess.run(["taskkill", "/F", "/IM", "Jungle.exe"], capture_output=True)
 
-    # Clean previous build artifacts.
+    print("Cleaning previous build artifacts…")
     _remove_tree(dist_dir)
+    _remove_tree(build_dir)
     _remove_tree(release_dir)
+    release_dir.mkdir(parents=True, exist_ok=True)
 
-    pyinstaller = shutil.which("pyinstaller") or str(repo_root / ".venv" / "Scripts" / "pyinstaller.exe")
-
-    cmd = [
-        pyinstaller,
+    pyinstaller = shutil.which("pyinstaller")
+    command = (
+        [pyinstaller] if pyinstaller else [sys.executable, "-m", "PyInstaller"]
+    ) + [
         "--onefile",
         "--windowed",
         "--name", "Jungle",
         "--distpath", str(dist_dir),
-        "--workpath", str(repo_root / "build"),
+        "--workpath", str(build_dir),
         "--specpath", str(repo_root),
-        str(repo_root / "main.py"),
+        "main.py",
     ]
-
-    print("Running:", " ".join(cmd))
-    result = subprocess.run(cmd, check=False)
+    print("Running:", " ".join(str(c) for c in command))
+    result = subprocess.run([str(c) for c in command])
     if result.returncode != 0:
-        print("PyInstaller failed")
-        return result.returncode
+        print("PyInstaller failed.")
+        return 1
 
-    release_dir.mkdir(parents=True, exist_ok=True)
-    exe_source = dist_dir / "Jungle.exe"
-    exe_dest = release_dir / "Jungle.exe"
-    _copy_with_retry(exe_source, exe_dest)
+    exe = dist_dir / "Jungle.exe"
+    if not exe.exists():
+        print(f"Expected executable not found at {exe}")
+        return 1
 
-    # Copy the release README (player-facing, with credits) to the release folder.
     readme_source = repo_root / "packaging" / "README.release.md"
+    if not readme_source.exists():
+        print(f"WARNING: {readme_source} is missing; the release README is required!")
+
+    _copy_with_retry(exe, release_dir / "Jungle.exe")
     if readme_source.exists():
         _copy_with_retry(readme_source, release_dir / "README.md")
-    else:
-        print("WARNING: packaging/README.release.md not found; release has no README")
 
-    print(f"Release executable: {exe_dest}")
+    size_mb = (release_dir / "Jungle.exe").stat().st_size / (1024 * 1024)
+    print(f"\nRelease written to {release_dir}")
+    print(f"  Jungle.exe  ({size_mb:.1f} MB)")
+    print(f"  README.md   {'OK' if (release_dir / 'README.md').exists() else 'MISSING!'}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

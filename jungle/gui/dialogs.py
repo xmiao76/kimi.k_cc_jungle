@@ -1,121 +1,129 @@
-"""Dialogs for game setup and game-over notifications."""
+"""Dialogs: new-game options and the (always non-modal) game-over notice.
+
+The game-over dialog must never be exec()'d: long modal Qt sessions inside
+tests triggered intermittent 0x8001010d crashes on Windows, so it is shown
+with ``show()`` and reports through signals instead.
+"""
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import (
+from typing import Optional
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QDialogButtonBox,
-    QGroupBox,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QRadioButton,
     QVBoxLayout,
     QWidget,
 )
 
+from jungle.engine.ai import STRENGTH_NAMES
+
 MODE_HUMAN_VS_AI = "human_vs_ai"
 MODE_AI_VS_AI = "ai_vs_ai"
 
-DIFFICULTY_EASY = "easy"
-DIFFICULTY_MEDIUM = "medium"
-DIFFICULTY_HARD = "hard"
-
 
 class NewGameDialog(QDialog):
-    """Dialog to choose game mode, first player, and difficulty."""
+    """Collects game mode, who moves first, and difficulty."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        mode: str = MODE_HUMAN_VS_AI,
+        ai_first: bool = False,
+        strength: str = "medium",
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("New Game")
         self.setModal(True)
 
-        self._layout = QVBoxLayout(self)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
 
-        mode_box = QGroupBox("Mode", self)
-        mode_layout = QVBoxLayout(mode_box)
-        self._mode_human = QRadioButton("Human vs AI")
-        self._mode_human.setChecked(True)
-        self._mode_ai = QRadioButton("AI vs AI")
-        mode_layout.addWidget(self._mode_human)
-        mode_layout.addWidget(self._mode_ai)
-        self._layout.addWidget(mode_box)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Human vs AI", MODE_HUMAN_VS_AI)
+        self.mode_combo.addItem("AI vs AI", MODE_AI_VS_AI)
+        self.mode_combo.setCurrentIndex(0 if mode == MODE_HUMAN_VS_AI else 1)
+        form.addRow("Mode", self.mode_combo)
 
-        first_box = QGroupBox("Who moves first?", self)
-        first_layout = QVBoxLayout(first_box)
-        self._human_first = QRadioButton("Human first")
-        self._human_first.setChecked(True)
-        self._ai_first = QRadioButton("AI first")
-        first_layout.addWidget(self._human_first)
-        first_layout.addWidget(self._ai_first)
-        self._first_box = first_box
-        self._layout.addWidget(first_box)
+        self.first_combo = QComboBox()
+        self.first_combo.addItem("Human moves first", False)
+        self.first_combo.addItem("AI moves first", True)
+        self.first_combo.setCurrentIndex(1 if ai_first else 0)
+        form.addRow("First move", self.first_combo)
 
-        level_box = QGroupBox("Difficulty", self)
-        level_layout = QVBoxLayout(level_box)
-        self._level_easy = QRadioButton("Easy (fast)")
-        self._level_medium = QRadioButton("Medium")
-        self._level_medium.setChecked(True)
-        self._level_hard = QRadioButton("Hard (slow)")
-        level_layout.addWidget(self._level_easy)
-        level_layout.addWidget(self._level_medium)
-        level_layout.addWidget(self._level_hard)
-        self._layout.addWidget(level_box)
+        self.strength_combo = QComboBox()
+        for name in STRENGTH_NAMES:
+            self.strength_combo.addItem(name.capitalize(), name)
+        self.strength_combo.setCurrentIndex(STRENGTH_NAMES.index(strength))
+        form.addRow("Difficulty", self.strength_combo)
 
-        self._mode_ai.toggled.connect(self._on_mode_toggled)
-        self._on_mode_toggled(False)
+        layout.addLayout(form)
 
-        self._button_box = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        self._button_box.accepted.connect(self.accept)
-        self._button_box.rejected.connect(self.reject)
-        self._layout.addWidget(self._button_box)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
-    def _on_mode_toggled(self, ai_vs_ai: bool) -> None:
-        # Side choice is meaningless when the AI plays both sides.
-        self._first_box.setEnabled(not ai_vs_ai)
+        self.mode_combo.currentIndexChanged.connect(self._sync_first_enabled)
+        self._sync_first_enabled()
 
-    def human_first(self) -> bool:
-        return self._human_first.isChecked()
+    def _sync_first_enabled(self) -> None:
+        self.first_combo.setEnabled(self.mode_combo.currentData() == MODE_HUMAN_VS_AI)
 
+    @property
     def mode(self) -> str:
-        return MODE_AI_VS_AI if self._mode_ai.isChecked() else MODE_HUMAN_VS_AI
+        return self.mode_combo.currentData()
 
-    def difficulty(self) -> str:
-        if self._level_easy.isChecked():
-            return DIFFICULTY_EASY
-        if self._level_hard.isChecked():
-            return DIFFICULTY_HARD
-        return DIFFICULTY_MEDIUM
+    @property
+    def ai_first(self) -> bool:
+        return bool(self.first_combo.currentData())
+
+    @property
+    def strength(self) -> str:
+        return self.strength_combo.currentData()
 
 
 class GameOverDialog(QDialog):
-    """Dialog shown when the game ends.
+    """Non-modal result notice with New Game / Quit actions.
 
-    "New Game" accepts (start over); "Stay" rejects (dismiss only — the
-    application must never quit just because a game ended).
+    Shown via ``show()``; never ``exec()``.
     """
 
-    def __init__(self, result_text: str, parent: QWidget | None = None) -> None:
+    new_game_requested = Signal()
+    quit_requested = Signal()
+
+    def __init__(self, message: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Game Over")
-        self.setModal(True)
+        self.setModal(False)
 
         layout = QVBoxLayout(self)
-        label = QLabel(result_text)
+        label = QLabel(message)
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
         layout.addWidget(label)
 
-        button_layout = QHBoxLayout()
-        new_game_btn = QPushButton("New Game")
-        stay_btn = QPushButton("Stay")
-        new_game_btn.clicked.connect(self.accept)
-        stay_btn.clicked.connect(self.reject)
-        button_layout.addWidget(new_game_btn)
-        button_layout.addWidget(stay_btn)
-        layout.addLayout(button_layout)
+        row = QHBoxLayout()
+        self.new_game_button = QPushButton("New Game")
+        self.quit_button = QPushButton("Quit")
+        row.addWidget(self.new_game_button)
+        row.addWidget(self.quit_button)
+        layout.addLayout(row)
 
-    def wants_new_game(self) -> bool:
-        return self.result() == QDialog.DialogCode.Accepted
+        self.new_game_button.clicked.connect(self._on_new_game)
+        self.quit_button.clicked.connect(self._on_quit)
+
+    def _on_new_game(self) -> None:
+        self.new_game_requested.emit()
+        self.close()
+
+    def _on_quit(self) -> None:
+        self.quit_requested.emit()
+        self.close()

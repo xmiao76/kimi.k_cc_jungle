@@ -1,192 +1,105 @@
-"""Smoke tests for the core board model."""
+"""Immutability, integrity, and consistency of Board and GameState."""
+
+import random
 
 import pytest
 
 from jungle.model.board import Board, GameState, IllegalMoveError, Move, Piece
-from jungle.model.constants import Rank, Side, Terrain, terrain_at
+from jungle.model.constants import Rank, Side
 
 
-def _board_with(pieces: dict[tuple[int, int], Piece]) -> Board:
-    rows: list[list[Piece | None]] = [[None for _ in range(7)] for _ in range(9)]
-    for (row, col), piece in pieces.items():
-        rows[row][col] = piece
-    return Board(tuple(tuple(row) for row in rows))
+def test_apply_move_returns_new_state_and_leaves_original_untouched(initial_state):
+    move = initial_state.legal_moves()[0]
+    new_state = initial_state.apply_move(move)
+    assert new_state is not initial_state
+    assert initial_state.move_count == 0
+    assert initial_state.current_side is Side.RED
+    assert new_state.move_count == 1
+    assert new_state.current_side is Side.BLUE
 
 
-def test_board_dimensions():
-    board = Board.starting()
-    assert board.ROWS == 9
-    assert board.COLS == 7
+def test_with_piece_moved_clears_origin_and_sets_destination():
+    board = Board.from_pieces({(2, 3): Piece(Side.RED, Rank.WOLF), (2, 4): Piece(Side.BLUE, Rank.CAT)})
+    moved = board.with_piece_moved((2, 3), (2, 4))
+    assert moved.piece_at((2, 3)) is None
+    assert moved.piece_at((2, 4)) == Piece(Side.RED, Rank.WOLF)
+    # Original board unchanged (immutability).
+    assert board.piece_at((2, 3)) == Piece(Side.RED, Rank.WOLF)
+    assert board.piece_at((2, 4)) == Piece(Side.BLUE, Rank.CAT)
 
 
-def test_starting_piece_counts():
-    board = Board.starting()
-    counts: dict[Side, int] = {Side.RED: 0, Side.BLUE: 0}
-    for pos in board.positions():
-        piece = board.piece_at(pos)
-        if piece is not None:
-            counts[piece.side] += 1
-    assert counts[Side.RED] == 8
-    assert counts[Side.BLUE] == 8
-
-
-def test_starting_layout():
-    board = Board.starting()
-    assert board.piece_at((0, 0)) == Piece(Side.BLUE, Rank.LION)
-    assert board.piece_at((0, 6)) == Piece(Side.BLUE, Rank.TIGER)
-    assert board.piece_at((1, 1)) == Piece(Side.BLUE, Rank.DOG)
-    assert board.piece_at((1, 5)) == Piece(Side.BLUE, Rank.CAT)
-    assert board.piece_at((2, 0)) == Piece(Side.BLUE, Rank.RAT)
-    assert board.piece_at((2, 6)) == Piece(Side.BLUE, Rank.ELEPHANT)
-    assert board.piece_at((8, 0)) == Piece(Side.RED, Rank.TIGER)
-    assert board.piece_at((8, 6)) == Piece(Side.RED, Rank.LION)
-    assert board.piece_at((6, 0)) == Piece(Side.RED, Rank.ELEPHANT)
-    assert board.piece_at((6, 6)) == Piece(Side.RED, Rank.RAT)
-    assert board.piece_at((7, 1)) == Piece(Side.RED, Rank.CAT)
-    assert board.piece_at((7, 5)) == Piece(Side.RED, Rank.DOG)
-
-
-def test_rotate_180_symmetry():
-    board = Board.starting()
-    rotated = board.rotate_180()
-    assert rotated.piece_at((8, 6)) == Piece(Side.BLUE, Rank.LION)
-    assert rotated.piece_at((0, 0)) == Piece(Side.RED, Rank.LION)
-    assert rotated.piece_at((0, 6)) == Piece(Side.RED, Rank.TIGER)
-    assert rotated.piece_at((8, 0)) == Piece(Side.BLUE, Rank.TIGER)
-
-
-def test_terrain():
-    assert terrain_at((0, 3)) is Terrain.DEN_BLUE
-    assert terrain_at((8, 3)) is Terrain.DEN_RED
-    assert terrain_at((3, 1)) is Terrain.RIVER
-    assert terrain_at((3, 4)) is Terrain.RIVER
-    assert terrain_at((0, 2)) is Terrain.TRAP_BLUE
-    assert terrain_at((8, 2)) is Terrain.TRAP_RED
-    assert terrain_at((4, 3)) is Terrain.LAND
-
-
-def test_legal_move_basic():
-    state = GameState(board=Board.starting(), current_side=Side.RED)
-    # Red tiger at (8,0) can move up to (7,0).
-    assert state.is_legal_move(Move((8, 0), (7, 0)))
-
-
-def test_cannot_move_into_own_den():
-    state = GameState(board=Board.starting(), current_side=Side.RED)
-    moves = state.legal_moves()
-    for move in moves:
-        terrain = terrain_at(move.to_pos)
-        piece = state.board.piece_at(move.from_pos)
-        assert piece is not None
-        if terrain is Terrain.DEN_RED:
-            assert piece.side is not Side.RED
-        if terrain is Terrain.DEN_BLUE:
-            assert piece.side is not Side.BLUE
-
-
-def test_rat_can_enter_river():
-    board = _board_with({(2, 1): Piece(Side.RED, Rank.RAT)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((2, 1), (3, 1)))
-
-
-def test_lion_cannot_enter_river():
-    board = _board_with({(2, 1): Piece(Side.RED, Rank.LION)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((2, 1), (3, 1)))
-
-
-def test_rat_captures_elephant_on_land():
-    board = _board_with({
-        (2, 0): Piece(Side.RED, Rank.RAT),
-        (2, 1): Piece(Side.BLUE, Rank.ELEPHANT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((2, 0), (2, 1)))
-
-
-def test_elephant_cannot_capture_rat():
-    board = _board_with({
-        (2, 0): Piece(Side.RED, Rank.ELEPHANT),
-        (2, 1): Piece(Side.BLUE, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((2, 0), (2, 1)))
-
-
-def test_rat_in_river_safe_from_land():
-    board = _board_with({
-        (3, 1): Piece(Side.RED, Rank.RAT),
-        (2, 1): Piece(Side.BLUE, Rank.LION),
-    })
-    state = GameState(board=board, current_side=Side.BLUE)
-    assert not state.is_legal_move(Move((2, 1), (3, 1)))
-
-
-def test_lion_horizontal_jump():
-    board = _board_with({(4, 0): Piece(Side.RED, Rank.LION)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((4, 0), (4, 3)))
-
-
-def test_tiger_horizontal_jump():
-    board = _board_with({(4, 0): Piece(Side.RED, Rank.TIGER)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((4, 0), (4, 3)))
-
-
-def test_lion_vertical_jump():
-    board = _board_with({(2, 1): Piece(Side.RED, Rank.LION)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((2, 1), (6, 1)))
-
-
-def test_tiger_vertical_jump_illegal():
-    board = _board_with({(2, 1): Piece(Side.RED, Rank.TIGER)})
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((2, 1), (6, 1)))
-
-
-def test_jump_blocked_by_rat():
-    board = _board_with({
-        (2, 1): Piece(Side.RED, Rank.LION),
-        (4, 1): Piece(Side.BLUE, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    assert not state.is_legal_move(Move((2, 1), (6, 1)))
-
-
-def test_trap_reduces_rank():
-    board = _board_with({
-        (7, 3): Piece(Side.BLUE, Rank.ELEPHANT),
-        (8, 3): Piece(Side.RED, Rank.RAT),
-    })
-    # Wait, blue elephant is in red trap at (7,3). Red rat at (8,3) adjacent.
-    state = GameState(board=board, current_side=Side.RED)
-    assert state.is_legal_move(Move((8, 3), (7, 3)))
-
-
-def test_win_by_den():
-    board = _board_with({
-        (1, 3): Piece(Side.RED, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    new_state = state.after_move(Move((1, 3), (0, 3)))
-    assert new_state.winner is Side.RED
-
-
-def test_win_by_elimination():
-    board = _board_with({
-        (2, 0): Piece(Side.RED, Rank.LION),
-        (2, 1): Piece(Side.BLUE, Rank.RAT),
-    })
-    state = GameState(board=board, current_side=Side.RED)
-    new_state = state.after_move(Move((2, 0), (2, 1)))
-    assert new_state.winner is Side.RED
-
-
-def test_game_already_over_raises():
-    board = _board_with({(0, 3): Piece(Side.RED, Rank.RAT)})
-    state = GameState(board=board, current_side=Side.RED, winner=Side.RED)
+def test_with_piece_moved_requires_a_piece():
     with pytest.raises(IllegalMoveError):
-        state.after_move(Move((0, 3), (0, 2)))
+        Board.empty().with_piece_moved((2, 3), (2, 4))
+
+
+def test_rotate_180_twice_is_identity():
+    board = Board.starting()
+    assert board.rotate_180().rotate_180() == board
+
+
+def test_is_legal_move_matches_legal_moves(initial_state):
+    legal = set(initial_state.legal_moves())
+    assert legal  # sanity: the start position has moves
+    for move in legal:
+        assert initial_state.is_legal_move(move)
+    assert not initial_state.is_legal_move(Move((0, 0), (4, 4)))
+    assert not initial_state.is_legal_move(Move((0, 0), (0, 1)))  # blue's piece
+
+
+def test_apply_move_rejects_illegal_moves(initial_state):
+    with pytest.raises(IllegalMoveError):
+        initial_state.apply_move(Move((0, 0), (0, 1)))  # not RED's piece
+    with pytest.raises(IllegalMoveError):
+        initial_state.apply_move(Move((6, 0), (6, 0)))  # no-op move
+
+
+def test_apply_move_rejects_moves_after_game_over():
+    game = GameState.from_pieces({(2, 3): Piece(Side.RED, Rank.DOG), (2, 4): Piece(Side.BLUE, Rank.CAT)})
+    over = game.apply_move(Move((2, 3), (2, 4)))  # captures the last blue piece
+    assert over.is_game_over
+    assert over.legal_moves() == ()
+    with pytest.raises(IllegalMoveError):
+        over.apply_move(Move((2, 4), (2, 3)))
+
+
+def test_position_key_is_deterministic_and_side_dependent():
+    a = GameState.starting()
+    b = GameState.starting()
+    assert a.position_key == b.position_key
+    same_board_blue_to_move = GameState(a.board, Side.BLUE, 0, ())
+    assert same_board_blue_to_move.position_key != a.position_key
+
+
+def test_history_tracks_every_position(initial_state):
+    state = initial_state
+    moves_played = 0
+    for _ in range(4):
+        move = state.legal_moves()[0]
+        state = state.apply_move(move)
+        moves_played += 1
+    assert len(state.history) == 1 + moves_played
+    assert state.history[-1] == state.position_key
+
+
+def test_legal_move_generation_is_deterministic(initial_state):
+    assert initial_state.legal_moves() == initial_state.legal_moves()
+
+
+def test_random_games_keep_invariants():
+    """Seeded random playouts: piece counts never rise, history grows by one
+    key per ply, and the game always terminates within the ply cap."""
+    rng = random.Random(1234)
+    for _ in range(10):
+        state = GameState.starting()
+        plies = 0
+        while not state.is_game_over:
+            moves = state.legal_moves()
+            assert moves, "non-terminal state must have legal moves"
+            before = sum(1 for _ in state.board.positions())
+            state = state.apply_move(rng.choice(moves))
+            after = sum(1 for _ in state.board.positions())
+            assert after <= before
+            assert len(state.history) == state.move_count + 1
+            plies += 1
+            assert plies <= 200, "game exceeded the ply cap without terminating"

@@ -1,84 +1,106 @@
-"""Tests for GUI helper functions and dialogs."""
+"""BoardView geometry and selection mechanics (offscreen)."""
 
 import pytest
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPainter, QPixmap
-from PyQt6.QtWidgets import (
-    QApplication,
-    QDialogButtonBox,
-    QPushButton,
-)
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 
-from jungle.gui.assets import draw_piece
 from jungle.gui.board_view import BoardView
-from jungle.gui.dialogs import GameOverDialog, NewGameDialog
-from jungle.model.board import Board, GameState
-from jungle.model.constants import Rank, Side
+from jungle.model.board import GameState, Move, Piece
+from jungle.model.constants import COLS, ROWS, Rank, Side
 
 
-def test_draw_piece_does_not_crash(qtbot):
-    pixmap = QPixmap(100, 100)
-    pixmap.fill(Qt.GlobalColor.white)
-    painter = QPainter(pixmap)
-    draw_piece(painter, pixmap.rect().toRectF(), Side.RED, Rank.LION, selected=True)
-    painter.end()
-    assert not pixmap.isNull()
+@pytest.fixture()
+def view(qtbot, initial_state):
+    widget = BoardView()
+    qtbot.addWidget(widget)
+    widget.resize(560, 700)
+    widget.set_state(initial_state)
+    widget.show()
+    return widget
 
 
-def test_new_game_dialog_human_first(qtbot):
-    dialog = NewGameDialog()
-    qtbot.addWidget(dialog)
-    assert dialog.human_first() is True
-    dialog._ai_first.setChecked(True)
-    assert dialog.human_first() is False
+def test_cell_rect_and_pos_from_point_round_trip(view):
+    for row in range(ROWS):
+        for col in range(COLS):
+            center = view.cell_rect((row, col)).center()
+            assert view.pos_from_point(center.x(), center.y()) == (row, col)
 
 
-def test_new_game_dialog_accept(qtbot):
-    from PyQt6.QtWidgets import QDialog
-    dialog = NewGameDialog()
-    qtbot.addWidget(dialog)
-    ok = dialog._button_box.button(QDialogButtonBox.StandardButton.Ok)
-    qtbot.mouseClick(ok, Qt.MouseButton.LeftButton)
-    assert dialog.result() == QDialog.DialogCode.Accepted
+def test_pos_from_point_outside_grid_returns_none(view):
+    assert view.pos_from_point(-50, -50) is None
+    assert view.pos_from_point(view.width() + 50, view.height() + 50) is None
 
 
-def test_game_over_dialog_wants_new_game(qtbot):
-    dialog = GameOverDialog("Human")
-    qtbot.addWidget(dialog)
-    for child in dialog.findChildren(QPushButton):
-        if child.text() == "New Game":
-            qtbot.mouseClick(child, Qt.MouseButton.LeftButton)
-            break
-    assert dialog.wants_new_game() is True
-
-
-def test_board_view_state_setter(qtbot):
-    view = BoardView()
-    qtbot.addWidget(view)
-    state = GameState(board=Board.starting(), current_side=Side.RED)
-    view.set_state(state)
-    assert view.state() is state
-    assert view._selected_pos is None
-
-
-def test_board_view_flip(qtbot):
-    view = BoardView()
-    qtbot.addWidget(view)
-    state = GameState(board=Board.starting(), current_side=Side.RED)
-    view.set_state(state)
+def test_flip_transform_is_an_involution(view):
     view.set_flipped(True)
-    assert view._flipped is True
-    rect = view.cell_rect((8, 0))
-    # When flipped, bottom-left internal (8,0) displays near top-right.
-    assert rect.x() >= view.width() / 2 - 10
+    for pos in ((0, 0), (3, 3), (8, 6), (2, 4)):
+        display = view._display_pos(pos)
+        assert display == (ROWS - 1 - pos[0], COLS - 1 - pos[1])
+        assert view._board_pos(display) == pos
+    # And clicks still map to the underlying board position when flipped.
+    center = view.cell_rect((8, 0)).center()
+    assert view.pos_from_point(center.x(), center.y()) == (8, 0)
 
 
-def test_board_view_pos_from_point(qtbot):
-    view = BoardView()
-    qtbot.addWidget(view)
-    state = GameState(board=Board.starting(), current_side=Side.RED)
-    view.set_state(state)
-    view.resize(view.sizeHint())
-    rect = view.cell_rect((8, 0))
-    pos = view.pos_from_point(rect.center())
-    assert pos == (8, 0)
+def test_select_own_piece_populates_targets(view, initial_state):
+    view._select((6, 0))  # RED elephant... verify it is RED's piece first
+    piece = initial_state.board.piece_at((6, 0))
+    assert piece.side is Side.RED
+    expected = {m.to_pos for m in initial_state.legal_moves() if m.from_pos == (6, 0)}
+    assert set(view._targets) == expected
+    assert expected, "the elephant should have moves at the start"
+
+
+def test_clicking_enemy_piece_does_not_select(view):
+    view._select((6, 0))
+    QTest.mouseClick(view, Qt.MouseButton.LeftButton,
+                     pos=view.cell_rect((0, 0)).center().toPoint())
+    assert view._selected is None  # deselected, not re-selected to blue's lion
+
+
+def test_click_sequence_emits_move(qtbot, view):
+    emitted = []
+    view.move_requested.connect(emitted.append)
+    move = Move((6, 0), (5, 0))  # RED elephant steps forward
+    QTest.mouseClick(view, Qt.MouseButton.LeftButton,
+                     pos=view.cell_rect(move.from_pos).center().toPoint())
+    assert view._selected == (6, 0)
+    QTest.mouseClick(view, Qt.MouseButton.LeftButton,
+                     pos=view.cell_rect(move.to_pos).center().toPoint())
+    assert emitted == [move]
+    assert view._selected is None
+
+
+def test_click_illegal_destination_clears_without_emitting(view):
+    emitted = []
+    view.move_requested.connect(emitted.append)
+    QTest.mouseClick(view, Qt.MouseButton.LeftButton,
+                     pos=view.cell_rect((6, 0)).center().toPoint())
+    QTest.mouseClick(view, Qt.MouseButton.LeftButton,
+                     pos=view.cell_rect((4, 0)).center().toPoint())  # two steps: illegal
+    assert emitted == []
+    assert view._selected is None
+
+
+def test_input_disabled_blocks_interaction(view):
+    emitted = []
+    view.move_requested.connect(emitted.append)
+    view.set_input_enabled(False)
+    QTest.mouseClick(view, Qt.MouseButton.LeftButton,
+                     pos=view.cell_rect((6, 0)).center().toPoint())
+    assert view._selected is None
+    assert emitted == []
+
+
+def test_game_over_state_blocks_interaction(view):
+    over = GameState.from_pieces(
+        {(2, 3): Piece(Side.RED, Rank.DOG), (2, 4): Piece(Side.BLUE, Rank.CAT)}
+    )
+    over = over.apply_move(Move((2, 3), (2, 4)))  # red captures the last blue piece
+    assert over.is_game_over
+    view.set_state(over)
+    emitted = []
+    view.move_requested.connect(emitted.append)
+    QTest.mouseClick(view, Qt.MouseButton.LeftButton,
+                     pos=view.cell_rect((2, 4)).center().toPoint())
+    assert emitted == []

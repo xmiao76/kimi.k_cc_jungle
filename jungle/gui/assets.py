@@ -1,62 +1,64 @@
-"""Visual assets and piece rendering helpers."""
+"""Visual assets: palette, piece artwork, and terrain accents.
+
+All artwork is drawn in code with ``QPainter`` — there are no image files to
+bundle, and the animal glyphs come from the OS emoji font (Segoe UI Emoji is
+present on every supported Windows install).
+"""
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QRectF, Qt
-from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPen
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 
 from jungle.model.constants import Rank, Side
 
-# Animal symbols used for pieces. These render as animals in most modern fonts.
-PIECE_SYMBOLS: dict[Rank, str] = {
-    Rank.RAT: "🐀",
-    Rank.CAT: "🐈",
+# -- palette -------------------------------------------------------------------
+
+LAND_LIGHT = QColor("#EBDDB4")
+LAND_DARK = QColor("#DCC893")
+RIVER_FILL = QColor("#3D7AB8")
+RIVER_RIPPLE = QColor("#8FC3EE")
+TRAP_FILL = QColor("#E3B54C")
+TRAP_MARKER = QColor("#7A5B12")
+DEN_FILL_RED = QColor("#7E2A1E")
+DEN_FILL_BLUE = QColor("#1F4E79")
+DEN_STAR = QColor("#F4D03F")
+GRID_LINE = QColor("#6E5B34")
+SELECTION_RING = QColor("#F8C471")
+LEGAL_DOT = QColor(39, 174, 96, 190)
+LEGAL_CAPTURE = QColor(231, 76, 60, 220)
+LAST_MOVE = QColor("#E67E22")
+CAPTURE_FLASH = QColor("#C0392B")
+
+PIECE_FILL = {Side.RED: QColor("#C0392B"), Side.BLUE: QColor("#2471A3")}
+PIECE_RIM = {Side.RED: QColor("#6E1B12"), Side.BLUE: QColor("#123F5E")}
+PIECE_TEXT = QColor("#FDFEFE")
+PIECE_TEXT_OUTLINE = QColor(0, 0, 0, 170)
+
+EMOJI_FONT_FAMILY = "Segoe UI Emoji"
+LABEL_FONT_FAMILY = "Segoe UI"
+
+RANK_EMOJI = {
+    Rank.RAT: "🐭",
+    Rank.CAT: "🐱",
+    Rank.DOG: "🐶",
     Rank.WOLF: "🐺",
-    Rank.DOG: "🐕",
     Rank.LEOPARD: "🐆",
-    Rank.TIGER: "🐅",
+    Rank.TIGER: "🐯",
     Rank.LION: "🦁",
     Rank.ELEPHANT: "🐘",
 }
 
-# Short English names shown on pieces in a small font below the emoji.
-PIECE_NAMES: dict[Rank, str] = {
+RANK_LABEL = {
     Rank.RAT: "RAT",
     Rank.CAT: "CAT",
-    Rank.WOLF: "WLF",
     Rank.DOG: "DOG",
+    Rank.WOLF: "WLF",
     Rank.LEOPARD: "LEO",
-    Rank.TIGER: "TGR",
+    Rank.TIGER: "TIG",
     Rank.LION: "LIO",
     Rank.ELEPHANT: "ELE",
 }
-
-# Piece base colors by side.
-SIDE_COLORS: dict[Side, QColor] = {
-    Side.RED: QColor("#d9534f"),
-    Side.BLUE: QColor("#5bc0de"),
-}
-
-SIDE_DARK_COLORS: dict[Side, QColor] = {
-    Side.RED: QColor("#c9302c"),
-    Side.BLUE: QColor("#31b0d5"),
-}
-
-# Terrain colors.
-LAND_COLOR = QColor("#82cf5a")
-LAND_DARK_COLOR = QColor("#54a03c")
-RIVER_COLOR = QColor("#4facfe")
-RIVER_RIPPLE_COLOR = QColor("#a8d8ff")
-TRAP_RED_COLOR = QColor("#ff9999")
-TRAP_BLUE_COLOR = QColor("#99ccff")
-TRAP_RED_MARK_COLOR = QColor("#d64545")
-TRAP_BLUE_MARK_COLOR = QColor("#4585d6")
-DEN_RED_COLOR = QColor("#ff6666")
-DEN_BLUE_COLOR = QColor("#66b3ff")
-GRID_COLOR = QColor("#3e5f35")
-SELECTED_HIGHLIGHT = QColor("#ffeb3b")
-LEGAL_MOVE_COLOR = QColor("#ffffff")
-LAST_MOVE_COLOR = QColor("#ffd700")
 
 
 def draw_piece(
@@ -66,56 +68,84 @@ def draw_piece(
     rank: Rank,
     selected: bool = False,
 ) -> None:
-    """Draw a single piece inside `rect`: disc, emoji, and short name label."""
-    base_color = SIDE_COLORS[side]
-    dark_color = SIDE_DARK_COLORS[side]
+    """Draw one animal piece: a colored disc with its emoji and short label."""
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    margin = rect.width() * 0.07
+    disc = rect.adjusted(margin, margin, -margin, -margin)
 
-    # Outer circle with gradient-like effect via concentric circles.
-    margin = rect.width() * 0.05
-    outer = rect.adjusted(margin, margin, -margin, -margin)
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QBrush(dark_color))
-    painter.drawEllipse(outer)
+    painter.setPen(QPen(PIECE_RIM[side], max(2.0, rect.width() * 0.03)))
+    painter.setBrush(PIECE_FILL[side])
+    painter.drawEllipse(disc)
 
-    inner = outer.adjusted(outer.width() * 0.08, outer.width() * 0.08, -outer.width() * 0.08, -outer.width() * 0.08)
-    painter.setBrush(QBrush(base_color))
-    painter.drawEllipse(inner)
+    # Animal emoji, centered in the upper ~2/3 of the disc.
+    emoji_font = QFont(EMOJI_FONT_FAMILY)
+    emoji_font.setPixelSize(int(rect.height() * 0.42))
+    painter.setFont(emoji_font)
+    emoji_rect = QRectF(disc.x(), disc.y() + disc.height() * 0.04,
+                        disc.width(), disc.height() * 0.62)
+    painter.drawText(emoji_rect, Qt.AlignmentFlag.AlignCenter, RANK_EMOJI[rank])
 
-    # Animal emoji, centered in the upper part of the cell.
-    font = QFont("Segoe UI Emoji")
-    if not font.exactMatch():
-        font = QFont("Noto Color Emoji")
-    if not font.exactMatch():
-        font = QFont()
-    font.setPointSizeF(rect.width() * 0.42)
-    font.setBold(True)
-    painter.setFont(font)
-    painter.setPen(QPen(QColor("#222222")))
-    emoji_rect = QRectF(
-        rect.x(), rect.y() + rect.height() * 0.02, rect.width(), rect.height() * 0.62
-    )
-    painter.drawText(emoji_rect, Qt.AlignmentFlag.AlignCenter, PIECE_SYMBOLS[rank])
-
-    # Short name label near the bottom of the disc, with a dark halo so it
-    # stays readable on both side colors.
-    name_font = QFont()
-    name_font.setPointSizeF(max(5.0, rect.width() * 0.17))
-    name_font.setBold(True)
-    painter.setFont(name_font)
-    label_rect = QRectF(
-        rect.x(), rect.y() + rect.height() * 0.58, rect.width(), rect.height() * 0.32
-    )
-    painter.setPen(QPen(QColor(0, 0, 0, 170)))
-    painter.drawText(
-        label_rect.translated(1.0, 1.0), Qt.AlignmentFlag.AlignCenter, PIECE_NAMES[rank]
-    )
-    painter.setPen(QPen(QColor("#ffffff")))
-    painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, PIECE_NAMES[rank])
+    # Short name with a dark outline so it stays readable on any disc color.
+    label = RANK_LABEL[rank]
+    label_font = QFont(LABEL_FONT_FAMILY)
+    label_font.setPixelSize(max(8, int(rect.height() * 0.17)))
+    label_font.setBold(True)
+    painter.setFont(label_font)
+    path = QPainterPath()
+    baseline = disc.y() + disc.height() * 0.88
+    fm_width = painter.fontMetrics().horizontalAdvance(label)
+    path.addText(QPointF(disc.center().x() - fm_width / 2, baseline), label_font, label)
+    painter.strokePath(path, QPen(PIECE_TEXT_OUTLINE, max(2.0, rect.width() * 0.025)))
+    painter.fillPath(path, PIECE_TEXT)
 
     if selected:
-        pen = QPen(SELECTED_HIGHLIGHT)
-        pen.setWidthF(rect.width() * 0.08)
-        pen.setStyle(Qt.PenStyle.SolidLine)
-        painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawEllipse(outer)
+        painter.setPen(QPen(SELECTION_RING, max(3.0, rect.width() * 0.05)))
+        ring = disc.adjusted(-2, -2, 2, 2)
+        painter.drawEllipse(ring)
+
+
+def draw_ripple_accents(painter: QPainter, rect: QRectF) -> None:
+    """Two wave strokes across a river cell."""
+    painter.setPen(QPen(RIVER_RIPPLE, max(1.5, rect.width() * 0.03)))
+    for frac in (0.35, 0.65):
+        y = rect.y() + rect.height() * frac
+        path = QPainterPath(QPointF(rect.x() + rect.width() * 0.15, y))
+        path.quadTo(rect.center().x(), y - rect.height() * 0.18,
+                    rect.x() + rect.width() * 0.85, y)
+        painter.drawPath(path)
+
+
+def draw_trap_marker(painter: QPainter, rect: QRectF) -> None:
+    """Warning-triangle glyph centered in a trap cell."""
+    w, h = rect.width(), rect.height()
+    path = QPainterPath()
+    path.moveTo(rect.center().x(), rect.y() + h * 0.22)
+    path.lineTo(rect.x() + w * 0.22, rect.y() + h * 0.74)
+    path.lineTo(rect.x() + w * 0.78, rect.y() + h * 0.74)
+    path.closeSubpath()
+    painter.setPen(QPen(TRAP_MARKER, max(2.0, w * 0.035)))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPath(path)
+
+
+def draw_den_star(painter: QPainter, rect: QRectF) -> None:
+    """Five-pointed star centered in a den cell."""
+    import math
+
+    cx, cy = rect.center().x(), rect.center().y()
+    outer = rect.width() * 0.30
+    inner = outer * 0.45
+    path = QPainterPath()
+    for i in range(10):
+        radius = outer if i % 2 == 0 else inner
+        angle = -math.pi / 2 + i * math.pi / 5
+        point = QPointF(cx + radius * math.cos(angle), cy + radius * math.sin(angle))
+        if i == 0:
+            path.moveTo(point)
+        else:
+            path.lineTo(point)
+    path.closeSubpath()
+    painter.setPen(QPen(DEN_STAR, max(1.5, rect.width() * 0.02)))
+    painter.setBrush(DEN_STAR)
+    painter.drawPath(path)

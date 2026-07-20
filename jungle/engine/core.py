@@ -1,44 +1,55 @@
-"""Fast incremental position for search.
+"""Fast mutable search core mirroring ``jungle.model.board`` exactly.
 
-Mirrors the rules of jungle.model.board exactly, but with a flat integer
-board, make/undo, and incremental Zobrist keys. Correctness is enforced by
-differential tests against the model (tests/engine/test_core_differential.py).
-
-Piece encoding: 0 = empty; 1..8 = BLUE ranks; 9..16 = RED ranks (rank + 8).
-Move encoding: from_idx | (to_idx << 6); the capture is implicit in the board.
+Pieces are small ints (``rank | side << 4``), moves are packed ints
+(``from | to << 6``), and the Zobrist key is maintained incrementally under
+make/undo, so search never allocates board copies. Differential tests
+(``tests/engine/test_core_differential.py``) prove the move sets, position
+keys, and terminal outcomes match the immutable model on every position of
+seeded random playouts.
 """
 
 from __future__ import annotations
 
-from jungle.engine import tables
-from jungle.model.board import MAX_PLIES, REPETITION_LIMIT, Board, GameState, Move
-from jungle.model.constants import COLS, ROWS, Rank, Side, Terrain
-from jungle.model.zobrist import SIDE_KEY, TABLE, piece_code
+from typing import Optional
+
+from jungle.engine.tables import (
+    DEN_IDX,
+    IS_RIVER,
+    JUMPS,
+    NEIGHBORS,
+    TERRAIN,
+    TRAP_TABLE,
+)
+from jungle.model import zobrist
+from jungle.model.board import MAX_PLIES, REPETITION_LIMIT, GameState, Move
+from jungle.model.constants import COLS, Rank, Side, Terrain
 
 EMPTY = 0
-_RANK_RAT = Rank.RAT.value
-_RANK_ELEPHANT = Rank.ELEPHANT.value
-_RANK_LION = Rank.LION.value
-_RANK_TIGER = Rank.TIGER.value
+_SIDE_SHIFT = 4
+
+RED = 0
+BLUE = 1
+
+RANK_RAT = int(Rank.RAT)
+RANK_TIGER = int(Rank.TIGER)
+RANK_LION = int(Rank.LION)
+RANK_ELEPHANT = int(Rank.ELEPHANT)
 
 
-def code_of(side: Side, rank: Rank) -> int:
-    """Return the cell piece code for a side and rank."""
-    return piece_code(side, rank.value)
+def make_cell(side: int, rank: int) -> int:
+    return rank | (side << _SIDE_SHIFT)
 
 
-def rank_of(code: int) -> int:
-    """Return the rank value (1..8) of a nonzero piece code."""
-    return code if code <= 8 else code - 8
+def rank_of(cell: int) -> int:
+    return cell & 15
 
 
-def side_of(code: int) -> Side:
-    """Return the side of a nonzero piece code."""
-    return Side.RED if code > 8 else Side.BLUE
+def side_of(cell: int) -> int:
+    return (cell >> _SIDE_SHIFT) & 1
 
 
-def pack_move(from_idx: int, to_idx: int) -> int:
-    return from_idx | (to_idx << 6)
+def pack_move(frm: int, to: int) -> int:
+    return frm | (to << 6)
 
 
 def move_from(move: int) -> int:
@@ -49,256 +60,246 @@ def move_to(move: int) -> int:
     return (move >> 6) & 63
 
 
+def _pos_of(idx: int) -> tuple[int, int]:
+    return (idx // COLS, idx % COLS)
+
+
 def to_model_move(move: int) -> Move:
-    """Convert a packed move to the model's Move type."""
-    return Move(
-        (move_from(move) // COLS, move_from(move) % COLS),
-        (move_to(move) // COLS, move_to(move) % COLS),
-    )
+    return Move(_pos_of(move_from(move)), _pos_of(move_to(move)))
+
+
+def from_model_move(move: Move) -> int:
+    return pack_move(move.from_pos[0] * COLS + move.from_pos[1],
+                     move.to_pos[0] * COLS + move.to_pos[1])
 
 
 class FastPosition:
-    """Mutable search position with make/undo and incremental hashing."""
+    """Mutable position with make/undo and an incremental Zobrist key.
 
-    __slots__ = ("cells", "side", "key", "move_count", "piece_counts", "keys", "undo_stack")
+    Optionally carries incrementally maintained evaluation state (piece-square
+    table scores, per-rank piece counts, and per-rank piece indices — each
+    side has exactly one animal per rank) once ``attach_tables`` is called,
+    so leaf evaluation is O(1) instead of a full board scan.
+    """
 
-    def __init__(
-        self,
-        cells: list[int],
-        side: Side,
-        move_count: int = 0,
-        history: tuple[int, ...] = (),
-    ) -> None:
-        if len(cells) != tables.CELLS:
-            raise ValueError("Invalid cell count")
-        self.cells = cells
-        self.side = side
-        self.move_count = move_count
-        key = SIDE_KEY if side is Side.RED else 0
-        counts = [0, 0]
-        for i, code in enumerate(cells):
-            if code:
-                key ^= TABLE[i][code]
-                counts[0 if side_of(code) is Side.RED else 1] += 1
-        self.key = key
-        self.piece_counts = counts  # [RED, BLUE]
-        self.keys = list(history)
-        self.undo_stack: list[tuple[int, int, int, int]] = []
+    __slots__ = ("cells", "side", "move_count", "key", "piece_counts",
+                 "key_history", "key_counts", "_undo",
+                 "tables", "eval_scores", "rank_counts", "animal_idx")
+
+    def __init__(self) -> None:
+        self.cells: list[int] = [EMPTY] * 63
+        self.side: int = RED
+        self.move_count: int = 0
+        self.key: int = 0
+        self.piece_counts: list[int] = [0, 0]
+        self.key_history: list[int] = []
+        self.key_counts: dict[int, int] = {}
+        self._undo: list[tuple[int, int]] = []
+        self.tables = None
+        self.eval_scores: list[int] = [0, 0]
+        self.rank_counts: list[list[int]] = [[0] * 9, [0] * 9]
+        self.animal_idx: list[list[int]] = [[-1] * 9, [-1] * 9]
+
+    # -- construction -----------------------------------------------------
 
     @classmethod
-    def from_game_state(cls, state: GameState) -> FastPosition:
-        """Build a fast position from an immutable model state."""
-        cells = [EMPTY] * tables.CELLS
-        for pos in state.board.positions():
-            piece = state.board.piece_at(pos)
-            if piece is not None:
-                cells[pos[0] * COLS + pos[1]] = code_of(piece.side, piece.rank)
-        return cls(cells, state.current_side, state.move_count, state.history)
+    def from_game_state(cls, state: GameState) -> "FastPosition":
+        pos = cls()
+        for (row, col), piece in state.board.positions():
+            side = zobrist.side_index(piece.side)
+            pos.cells[row * COLS + col] = make_cell(side, int(piece.rank))
+            pos.piece_counts[side] += 1
+        pos.side = zobrist.side_index(state.current_side)
+        pos.move_count = state.move_count
+        pos.key = state.position_key
+        pos.key_history = list(state.history)
+        for key in pos.key_history:
+            pos.key_counts[key] = pos.key_counts.get(key, 0) + 1
+        return pos
 
-    def to_board(self) -> Board:
-        """Rebuild the immutable model board (for tests and debugging)."""
-        from jungle.model.board import Piece
+    def attach_tables(self, tables) -> None:
+        """Bind evaluation tables and compute incremental eval state once."""
+        self.tables = tables
+        scores = [0, 0]
+        counts = [[0] * 9, [0] * 9]
+        indices = [[-1] * 9, [-1] * 9]
+        for idx in range(63):
+            cell = self.cells[idx]
+            if cell == EMPTY:
+                continue
+            side = side_of(cell)
+            rank = rank_of(cell)
+            scores[side] += tables.pst[side][rank][idx]
+            counts[side][rank] += 1
+            indices[side][rank] = idx
+        self.eval_scores = scores
+        self.rank_counts = counts
+        self.animal_idx = indices
 
-        rows: list[list[Piece | None]] = []
-        for r in range(ROWS):
-            row: list[Piece | None] = []
-            for c in range(COLS):
-                code = self.cells[r * COLS + c]
-                row.append(
-                    None if code == EMPTY else Piece(side_of(code), Rank(rank_of(code)))
-                )
-            rows.append(row)
-        return Board(tuple(tuple(row) for row in rows))
-
-    # ------------------------------------------------------------------
-    # Move generation (mirrors GameState._moves_for_piece order of checks)
-    # ------------------------------------------------------------------
+    # -- move generation ----------------------------------------------------
 
     def legal_moves(self) -> list[int]:
-        """Return all legal packed moves for the side to move."""
+        """Packed legal moves for the side to move (mirrors the model)."""
         cells = self.cells
         side = self.side
-        own_den = tables.DEN_IDX[side]
+        own_den = DEN_IDX[side]
+        enemy_trap = TRAP_TABLE[side]  # enemy pieces there defend with rank 0
         moves: list[int] = []
-        for i, code in enumerate(cells):
-            if code == EMPTY or side_of(code) is not side:
+        append = moves.append
+        for idx in range(63):
+            cell = cells[idx]
+            if cell == EMPTY or side_of(cell) != side:
                 continue
-            rank = rank_of(code)
-            for nb in tables.NEIGHBORS[i]:
-                if tables.IS_RIVER[nb] and rank != _RANK_RAT:
+            rank = rank_of(cell)
+            from_river = IS_RIVER[idx]
+            for to in NEIGHBORS[idx]:
+                terrain = TERRAIN[to]
+                if terrain is Terrain.RIVER and rank != RANK_RAT:
                     continue
-                if nb == own_den:
+                if to == own_den:
                     continue
-                target = cells[nb]
-                if target != EMPTY and not self._can_capture(code, i, nb, target):
+                occ = cells[to]
+                if occ == EMPTY:
+                    append(pack_move(idx, to))
                     continue
-                moves.append(i | (nb << 6))
-            if rank == _RANK_LION:
-                jumps = tables.JUMPS_LION[i]
-            elif rank == _RANK_TIGER:
-                jumps = tables.JUMPS_TIGER[i]
-            else:
-                continue
-            for landing, crossed in jumps:
-                blocked = False
-                for sq in crossed:
-                    sq_code = cells[sq]
-                    if sq_code != EMPTY and rank_of(sq_code) == _RANK_RAT:
-                        blocked = True
-                        break
-                if blocked:
+                if side_of(occ) == side:
                     continue
-                target = cells[landing]
-                if target != EMPTY and not self._can_capture(code, i, landing, target):
+                if from_river != IS_RIVER[to]:
+                    continue  # no land<->river captures
+                defence = rank_of(occ)
+                if rank == RANK_ELEPHANT and defence == RANK_RAT:
+                    continue  # elephant never captures rat
+                if rank == RANK_RAT and defence == RANK_ELEPHANT:
+                    append(pack_move(idx, to))
                     continue
-                moves.append(i | (landing << 6))
+                if enemy_trap[to]:
+                    defence = 0
+                if rank >= defence:
+                    append(pack_move(idx, to))
+            if rank == RANK_TIGER or rank == RANK_LION:
+                for landing, path in JUMPS[rank][idx]:
+                    blocked = False
+                    for square in path:
+                        if cells[square] != EMPTY:
+                            blocked = True  # a rat (either side) blocks the jump
+                            break
+                    if blocked:
+                        continue
+                    occ = cells[landing]
+                    if occ == EMPTY:
+                        append(pack_move(idx, landing))
+                        continue
+                    if side_of(occ) == side:
+                        continue
+                    defence = rank_of(occ)
+                    if enemy_trap[landing]:
+                        defence = 0
+                    if rank >= defence:
+                        append(pack_move(idx, landing))
         return moves
 
-    def has_legal_move(self) -> bool:
-        """Return True if the side to move has at least one legal move."""
-        cells = self.cells
-        side = self.side
-        own_den = tables.DEN_IDX[side]
-        for i, code in enumerate(cells):
-            if code == EMPTY or side_of(code) is not side:
-                continue
-            rank = rank_of(code)
-            for nb in tables.NEIGHBORS[i]:
-                if tables.IS_RIVER[nb] and rank != _RANK_RAT:
-                    continue
-                if nb == own_den:
-                    continue
-                target = cells[nb]
-                if target == EMPTY or self._can_capture(code, i, nb, target):
-                    return True
-            if rank == _RANK_LION:
-                jumps = tables.JUMPS_LION[i]
-            elif rank == _RANK_TIGER:
-                jumps = tables.JUMPS_TIGER[i]
-            else:
-                continue
-            for landing, crossed in jumps:
-                if any(
-                    (sq_code := cells[sq]) != EMPTY and rank_of(sq_code) == _RANK_RAT
-                    for sq in crossed
-                ):
-                    continue
-                target = cells[landing]
-                if target == EMPTY or self._can_capture(code, i, landing, target):
-                    return True
-        return False
-
-    def _can_capture(self, attacker: int, from_idx: int, to_idx: int, target: int) -> bool:
-        """Mirror GameState._can_capture (see model for rule references)."""
-        if side_of(attacker) is side_of(target):
-            return False
-        attacker_rank = rank_of(attacker)
-        target_rank = rank_of(target)
-        # Defender in a trap belonging to the attacker's side has rank 0.
-        terrain = tables.TERRAIN[to_idx]
-        if side_of(attacker) is Side.RED:
-            defender_rank = 0 if terrain is Terrain.TRAP_RED else target_rank
-        else:
-            defender_rank = 0 if terrain is Terrain.TRAP_BLUE else target_rank
-
-        if attacker_rank == _RANK_RAT:
-            attacker_in_water = tables.IS_RIVER[from_idx]
-            target_in_water = tables.IS_RIVER[to_idx]
-            if attacker_in_water:
-                return target_in_water and target_rank == _RANK_RAT
-            if target_in_water:
-                return False
-            if target_rank == _RANK_ELEPHANT:
-                return True
-            return attacker_rank >= defender_rank
-
-        if target_rank == _RANK_RAT:
-            if attacker_rank == _RANK_ELEPHANT:
-                return False
-            if tables.IS_RIVER[to_idx]:
-                return False
-
-        return attacker_rank >= defender_rank
-
-    # ------------------------------------------------------------------
-    # Make / undo
-    # ------------------------------------------------------------------
+    # -- make / undo ----------------------------------------------------------
 
     def make(self, move: int) -> None:
-        """Apply a packed move, pushing an undo record."""
         cells = self.cells
-        from_idx = move & 63
-        to_idx = move >> 6
-        piece = cells[from_idx]
-        captured = cells[to_idx]
-        self.undo_stack.append((move, captured, self.key, self.move_count))
-        self.keys.append(self.key)
+        frm = move & 63
+        to = (move >> 6) & 63
+        cell = cells[frm]
+        captured = cells[to]
+        self._undo.append((move, captured))
 
-        new_key = self.key ^ TABLE[from_idx][piece] ^ TABLE[to_idx][piece] ^ SIDE_KEY
+        key = self.key ^ zobrist.PIECE_KEYS[side_of(cell)][rank_of(cell)][frm]
+        key ^= zobrist.PIECE_KEYS[side_of(cell)][rank_of(cell)][to]
         if captured != EMPTY:
-            new_key ^= TABLE[to_idx][captured]
-            self.piece_counts[0 if side_of(captured) is Side.RED else 1] -= 1
-        cells[from_idx] = EMPTY
-        cells[to_idx] = piece
-        self.key = new_key
-        self.side = Side.BLUE if self.side is Side.RED else Side.RED
+            key ^= zobrist.PIECE_KEYS[side_of(captured)][rank_of(captured)][to]
+            self.piece_counts[side_of(captured)] -= 1
+        key ^= zobrist.SIDE_TO_MOVE_KEY
+
+        tables = self.tables
+        if tables is not None:
+            side = side_of(cell)
+            rank = rank_of(cell)
+            self.eval_scores[side] += tables.pst[side][rank][to] - tables.pst[side][rank][frm]
+            self.animal_idx[side][rank] = to
+            if captured != EMPTY:
+                cap_side = side_of(captured)
+                cap_rank = rank_of(captured)
+                self.eval_scores[cap_side] -= tables.pst[cap_side][cap_rank][to]
+                self.rank_counts[cap_side][cap_rank] -= 1
+                self.animal_idx[cap_side][cap_rank] = -1
+
+        cells[to] = cell
+        cells[frm] = EMPTY
+        self.side ^= 1
         self.move_count += 1
+        self.key = key
+        self.key_history.append(key)
+        self.key_counts[key] = self.key_counts.get(key, 0) + 1
 
     def undo(self) -> None:
-        """Revert the most recent make()."""
-        move, captured, old_key, old_count = self.undo_stack.pop()
+        move, captured = self._undo.pop()
+        frm = move & 63
+        to = (move >> 6) & 63
         cells = self.cells
-        from_idx = move & 63
-        to_idx = move >> 6
-        piece = cells[to_idx]
-        cells[from_idx] = piece
-        cells[to_idx] = captured
+        cell = cells[to]
+
+        tables = self.tables
+        if tables is not None:
+            side = side_of(cell)
+            rank = rank_of(cell)
+            self.eval_scores[side] -= tables.pst[side][rank][to] - tables.pst[side][rank][frm]
+            self.animal_idx[side][rank] = frm
+            if captured != EMPTY:
+                cap_side = side_of(captured)
+                cap_rank = rank_of(captured)
+                self.eval_scores[cap_side] += tables.pst[cap_side][cap_rank][to]
+                self.rank_counts[cap_side][cap_rank] += 1
+                self.animal_idx[cap_side][cap_rank] = to
+
+        remaining = self.key_counts[self.key] - 1
+        if remaining:
+            self.key_counts[self.key] = remaining
+        else:
+            # Keep the counter map exact — dead zero entries would accumulate
+            # over a long search (game-history keys never reach zero).
+            del self.key_counts[self.key]
+        self.key_history.pop()
+        self.side ^= 1
+        self.move_count -= 1
+        cells[frm] = cell
+        cells[to] = captured
         if captured != EMPTY:
-            self.piece_counts[0 if side_of(captured) is Side.RED else 1] += 1
-        self.side = Side.BLUE if self.side is Side.RED else Side.RED
-        self.key = old_key
-        self.move_count = old_count
-        self.keys.pop()
+            self.piece_counts[side_of(captured)] += 1
+        self.key = self.key_history[-1]
 
-    # ------------------------------------------------------------------
-    # Terminal / draw queries
-    # ------------------------------------------------------------------
+    # -- outcomes ---------------------------------------------------------------
 
-    def winner(self) -> Side | None:
-        """Return the winner by den entry or elimination (cheap checks)."""
-        red_den = self.cells[tables.DEN_IDX[Side.RED]]
-        if red_den != EMPTY and side_of(red_den) is Side.BLUE:
-            return Side.BLUE
-        blue_den = self.cells[tables.DEN_IDX[Side.BLUE]]
-        if blue_den != EMPTY and side_of(blue_den) is Side.RED:
-            return Side.RED
-        if self.piece_counts[0] == 0:
-            return Side.BLUE
-        if self.piece_counts[1] == 0:
-            return Side.RED
+    def winner(self) -> Optional[int]:
+        """Winning side index, or None. (The no-legal-moves loss is detected
+        by an empty move list, matching how search consumes it.)"""
+        occupant = self.cells[DEN_IDX[RED]]
+        if occupant != EMPTY and side_of(occupant) == BLUE:
+            return BLUE
+        occupant = self.cells[DEN_IDX[BLUE]]
+        if occupant != EMPTY and side_of(occupant) == RED:
+            return RED
+        if self.piece_counts[RED] == 0:
+            return BLUE
+        if self.piece_counts[BLUE] == 0:
+            return RED
         return None
 
-    def is_repetition(self) -> bool:
-        """Return True if the current position occurred before on the path."""
-        return self.key in self.keys
+    def is_repetition_draw(self) -> bool:
+        return self.key_counts.get(self.key, 0) >= REPETITION_LIMIT
 
-    def is_draw(self) -> bool:
-        """Return True by threefold repetition or the ply cap (model rules)."""
-        return (
-            self.keys.count(self.key) >= REPETITION_LIMIT - 1
-            or self.move_count >= MAX_PLIES
-        )
+    def is_ply_cap_draw(self) -> bool:
+        return self.move_count >= MAX_PLIES
 
-    def is_terminal(self) -> tuple[bool, Side | None, bool]:
-        """Mirror GameState terminal semantics: (over, winner, draw).
+    def model_side(self) -> Side:
+        return Side.RED if self.side == RED else Side.BLUE
 
-        Order matches the model: den/elimination, then stalemate, then draw.
-        """
-        w = self.winner()
-        if w is not None:
-            return True, w, False
-        if not self.has_legal_move():
-            return True, Side.BLUE if self.side is Side.RED else Side.RED, False
-        if self.is_draw():
-            return True, None, True
-        return False, None, False
+    def to_debug_grid(self) -> str:  # pragma: no cover - debugging aid
+        rows = []
+        for row in range(9):
+            rows.append(" ".join(f"{self.cells[row * COLS + col]:2d}" for col in range(COLS)))
+        return "\n".join(rows)

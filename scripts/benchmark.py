@@ -1,56 +1,65 @@
-"""Engine benchmark: iterative-deepening depth, nodes, and speed per position."""
+"""Fixed-depth search benchmark: nodes, time, and NPS per position."""
 
-import random
+from __future__ import annotations
+
+import os
 import sys
 import time
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from jungle.engine.core import FastPosition  # noqa: E402
-from jungle.engine.search import SearchConfig, Searcher  # noqa: E402
-from jungle.model.board import Board, GameState  # noqa: E402
-from jungle.model.constants import Side  # noqa: E402
+from jungle.engine.core import FastPosition, to_model_move
+from jungle.engine.search import SearchConfig, Searcher
+from jungle.model.board import GameState, Move, Piece
+from jungle.model.constants import Rank, Side
 
+DEPTH = 5
 
-def _middlegame(seed: int, plies: int) -> GameState:
-    rng = random.Random(seed)
-    state = GameState(board=Board.starting(), current_side=Side.RED)
-    for _ in range(plies):
-        moves = state.legal_moves()
-        if not moves or state.winner is not None or state.draw:
-            break
-        state = state.after_move(rng.choice(moves))
-    return state
+POSITIONS: list[tuple[str, GameState]] = []
 
 
-POSITIONS = {
-    "start": GameState(board=Board.starting(), current_side=Side.RED),
-    "midgame-12": _middlegame(7, 12),
-    "midgame-24": _middlegame(13, 24),
-}
-
-
-def benchmark(state: GameState, max_depth: int) -> tuple[int, int, float]:
-    pos = FastPosition.from_game_state(state)
-    searcher = Searcher(
-        SearchConfig(max_depth=max_depth, soft_limit_s=600.0, hard_limit_s=1200.0)
+def _build_positions() -> None:
+    start = GameState.starting()
+    mid = start
+    for move in (Move((6, 0), (5, 0)), Move((2, 6), (2, 5)),
+                 Move((8, 0), (7, 0)), Move((0, 0), (1, 0)),
+                 Move((6, 4), (6, 3)), Move((2, 2), (2, 3)),
+                 Move((7, 1), (6, 1)), Move((1, 5), (1, 4))):
+        mid = mid.apply_move(move)
+    tactical = GameState.from_pieces(
+        {
+            (3, 3): Piece(Side.RED, Rank.LION),
+            (3, 2): Piece(Side.BLUE, Rank.RAT),
+            (3, 6): Piece(Side.BLUE, Rank.DOG),
+            (6, 1): Piece(Side.RED, Rank.RAT),
+            (7, 2): Piece(Side.BLUE, Rank.CAT),
+        },
+        current_side=Side.RED,
     )
-    start = time.perf_counter()
-    result = searcher.search(pos)
-    elapsed = time.perf_counter() - start
-    return result.depth, result.nodes, elapsed
+    POSITIONS.extend([("start", start), ("midgame", mid), ("tactical", tactical)])
 
 
 def main() -> int:
-    max_depth = int(sys.argv[1]) if len(sys.argv) > 1 else 6
-    print(f"{'position':<12} {'depth':>5} {'nodes':>12} {'time s':>8} {'nps':>12}")
-    for name, state in POSITIONS.items():
-        depth, nodes, elapsed = benchmark(state, max_depth)
-        nps = int(nodes / elapsed) if elapsed > 0 else 0
-        print(f"{name:<12} {depth:>5} {nodes:>12} {elapsed:>8.2f} {nps:>12}")
+    _build_positions()
+    config = SearchConfig(max_depth=DEPTH, soft_limit_s=600.0, hard_limit_s=1200.0)
+    total_nodes = 0
+    total_time = 0.0
+    for name, state in POSITIONS:
+        searcher = Searcher(config)
+        pos = FastPosition.from_game_state(state)
+        start = time.monotonic()
+        result = searcher.search(pos)
+        elapsed = time.monotonic() - start
+        nps = result.nodes / elapsed if elapsed > 0 else 0.0
+        total_nodes += result.nodes
+        total_time += elapsed
+        print(f"{name:9s} depth {result.depth}: {result.nodes:>9,} nodes in {elapsed:6.2f}s "
+              f"= {nps:>9,.0f} nps  best={to_model_move(result.best_move)} score={result.score:+}")
+    if total_time > 0:
+        print(f"overall  : {total_nodes:>9,} nodes in {total_time:6.2f}s "
+              f"= {total_nodes / total_time:>9,.0f} nps")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

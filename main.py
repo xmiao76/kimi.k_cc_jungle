@@ -1,87 +1,79 @@
-"""Entry point for the Jungle / Dou Shou Qi desktop application."""
+"""Application entry point.
+
+Usage:
+    python main.py [--strength easy|medium|hard] [--ai-first] [--ai-vs-ai]
+                   [--depth N] [--time-limit SECONDS] [--flip]
+"""
+
+from __future__ import annotations
 
 import argparse
+import os
 import sys
 import traceback
-from pathlib import Path
 
-from PyQt6.QtWidgets import QApplication, QMessageBox
-
-from jungle.gui.main_window import DIFFICULTY_PRESETS, MainWindow
+from jungle.engine.ai import STRENGTH_NAMES
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="Jungle",
-        description="Jungle / Dou Shou Qi board game with AI",
+        description="Jungle / Dou Shou Qi — play against the built-in AI.",
     )
-    parser.add_argument(
-        "--ai-first",
-        action="store_true",
-        help="Let the AI move first (default: human first).",
-    )
-    parser.add_argument(
-        "--depth",
-        type=int,
-        default=None,
-        help="Override the AI max search depth for the chosen strength.",
-    )
-    parser.add_argument(
-        "--strength",
-        choices=sorted(DIFFICULTY_PRESETS),
-        default="medium",
-        help="AI difficulty preset (default: medium).",
-    )
-    parser.add_argument(
-        "--time-limit",
-        type=float,
-        default=None,
-        metavar="SECONDS",
-        help="Override the AI soft time limit per move.",
-    )
-    parser.add_argument(
-        "--ai-vs-ai",
-        action="store_true",
-        help="Watch the AI play against itself.",
-    )
-    parser.add_argument(
-        "--flip",
-        action="store_true",
-        help="Start with the board flipped visually.",
-    )
+    parser.add_argument("--strength", choices=STRENGTH_NAMES, default="medium",
+                        help="AI difficulty (default: medium)")
+    parser.add_argument("--ai-first", action="store_true",
+                        help="the AI moves first (you play BLUE)")
+    parser.add_argument("--ai-vs-ai", action="store_true",
+                        help="watch the AI play itself")
+    parser.add_argument("--depth", type=int, default=None,
+                        help="override the AI max search depth")
+    parser.add_argument("--time-limit", type=float, default=None,
+                        help="override the AI thinking time per move (seconds)")
+    parser.add_argument("--flip", action="store_true",
+                        help="start with the board flipped (view only)")
     return parser.parse_args(argv)
 
 
-def _install_excepthook() -> None:
-    """Show (and log) unexpected errors instead of vanishing silently."""
+def _crash_log_path() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(sys.executable), "jungle-crash.log")
+    return os.path.join(os.getcwd(), "jungle-crash.log")
 
-    def _hook(exc_type, exc_value, exc_tb) -> None:
+
+def _install_excepthook() -> None:
+    def hook(exc_type, exc_value, exc_tb) -> None:
         text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        sys.stderr.write(text)
         try:
-            base = (
-                Path(sys.executable).parent
-                if getattr(sys, "frozen", False)
-                else Path.cwd()
-            )
-            with open(base / "jungle-crash.log", "a", encoding="utf-8") as fh:
-                fh.write(text + "\n")
+            with open(_crash_log_path(), "a", encoding="utf-8") as handle:
+                handle.write(text + "\n")
         except OSError:
             pass
-        QMessageBox.critical(
-            None,
-            "Unexpected error",
-            "Jungle hit an unexpected error but will try to keep running.\n\n"
-            f"{exc_type.__name__}: {exc_value}",
-        )
+        try:
+            from PySide6.QtWidgets import QMessageBox
 
-    sys.excepthook = _hook
+            QMessageBox.critical(None, "Jungle crashed",
+                                 f"An unexpected error occurred.\n\n{exc_value}\n\n"
+                                 f"Details were written to jungle-crash.log.")
+        except Exception:
+            pass
+
+    sys.excepthook = hook
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    app = QApplication(sys.argv)
+
+    from PySide6.QtWidgets import QApplication
+
+    from jungle.gui.main_window import MainWindow
+    from jungle.gui.styles import APP_QSS
+
+    app = QApplication(sys.argv[:1])
     app.setApplicationName("Jungle")
-    app.setApplicationVersion("2.0.0")
+    app.setOrganizationName("JungleGame")
+    app.setStyleSheet(APP_QSS)
     _install_excepthook()
 
     window = MainWindow(
@@ -93,9 +85,8 @@ def main(argv: list[str] | None = None) -> int:
         ai_vs_ai=args.ai_vs_ai,
     )
     window.show()
-
     return app.exec()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

@@ -1,48 +1,66 @@
-"""Print perft node counts from the standard start (model vs fast core)."""
+"""Perft conformance: model vs fast core, from the start and a tactical spot."""
 
+from __future__ import annotations
+
+import os
 import sys
 import time
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from jungle.engine.core import FastPosition  # noqa: E402
-from jungle.model.board import Board, GameState, IllegalMoveError  # noqa: E402
-from jungle.model.constants import Side  # noqa: E402
-from tests.engine.test_perft import perft  # noqa: E402
+from jungle.engine.core import FastPosition
+from jungle.model.board import GameState, Piece
+from jungle.model.constants import Rank, Side
 
 
-def model_perft(state: GameState, depth: int) -> int:
-    if depth == 0 or state.winner is not None or state.draw:
+def perft_model(state: GameState, depth: int) -> int:
+    if depth == 0:
+        return 1
+    return sum(perft_model(state.apply_move(move), depth - 1) for move in state.legal_moves())
+
+
+def perft_core(pos: FastPosition, depth: int) -> int:
+    if depth == 0:
         return 1
     total = 0
-    for move in state.legal_moves():
-        try:
-            child = state.after_move(move)
-        except IllegalMoveError:
-            continue
-        total += model_perft(child, depth - 1)
+    for move in pos.legal_moves():
+        pos.make(move)
+        total += perft_core(pos, depth - 1)
+        pos.undo()
     return total
 
 
+def _tactical_state() -> GameState:
+    return GameState.from_pieces(
+        {
+            (3, 3): Piece(Side.RED, Rank.LION),
+            (3, 2): Piece(Side.BLUE, Rank.RAT),
+            (3, 6): Piece(Side.BLUE, Rank.DOG),
+            (6, 1): Piece(Side.RED, Rank.RAT),
+            (7, 2): Piece(Side.BLUE, Rank.CAT),
+        },
+        current_side=Side.RED,
+    )
+
+
 def main() -> int:
-    max_depth = int(sys.argv[1]) if len(sys.argv) > 1 else 4
-    state = GameState(board=Board.starting(), current_side=Side.RED)
-    fast = FastPosition.from_game_state(state)
-    print(f"{'depth':>5} {'model':>12} {'fast':>12} {'model s':>8} {'fast s':>8}")
-    for depth in range(1, max_depth + 1):
-        t0 = time.perf_counter()
-        model_count = model_perft(state, depth) if depth <= 3 else None
-        t1 = time.perf_counter()
-        fast_count = perft(fast, depth)
-        t2 = time.perf_counter()
-        model_s = f"{t1 - t0:8.2f}" if model_count is not None else "     n/a"
-        print(
-            f"{depth:>5} {model_count if model_count is not None else '':>12} "
-            f"{fast_count:>12} {model_s} {t2 - t1:8.2f}"
-        )
-    return 0
+    failures = 0
+    for label, state, max_depth in (
+        ("start", GameState.starting(), 4),
+        ("tactical", _tactical_state(), 3),
+    ):
+        for depth in range(1, max_depth + 1):
+            start = time.monotonic()
+            model_count = perft_model(state, depth)
+            core_count = perft_core(FastPosition.from_game_state(state), depth)
+            elapsed = time.monotonic() - start
+            ok = model_count == core_count
+            failures += 0 if ok else 1
+            status = "OK " if ok else "MISMATCH"
+            print(f"{status} {label:9s} depth {depth}: model={model_count} core={core_count} "
+                  f"({elapsed:.2f}s)")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

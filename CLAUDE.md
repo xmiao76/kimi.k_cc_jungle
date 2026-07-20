@@ -1,99 +1,61 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) working in this repository.
 
 ## Project
 
-Windows desktop implementation of **Jungle / Dou Shou Qi** (鬥獸棋) built with Python and PyQt6.
-A human player competes against a built-in AI on a visual 9×7 board.
+Windows desktop **Jungle / Dou Shou Qi** (鬥獸棋) game: Python 3.12 + PySide6,
+human vs built-in AI on a visual 9×7 board. Specification: `prompt.md` (repo
+root — keep it tracked and untouched).
 
-## Common Commands
-
-All commands assume a Windows environment and a virtual environment at `.venv/`.
+## Commands
 
 ```bash
-# Create / activate virtual environment
-python -m venv .venv
-.venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run from source
-python main.py
-python main.py --ai-first --strength hard
-python main.py --ai-vs-ai --strength easy
-
-# Run tests
-pytest
-
-# Run slow strength/performance tests (gauntlet vs legacy engine, depth-5 benchmark)
-pytest -m slow
-
-# Run tests with coverage (required: ≥80%)
-pytest --cov=jungle --cov-report=term-missing --cov-fail-under=80
-
-# Type check
-mypy jungle main.py
-
-# Engine tooling
-python scripts\benchmark.py     # depth/nodes/nps per position
-python scripts\perft.py         # fast-core vs model node-count conformance
-python scripts\gauntlet.py      # self-play vs legacy baseline engine
-python scripts\gauntlet.py --baseline v2 --games 20  # vs frozen previous generation
-python scripts\ai_vs_ai_smoke.py  # headless full-game GUI smoke test
-
-# Package executable
-python package.py
-python scripts\smoke_release.py
-# Output: release/Jungle.exe + release/README.md
+python main.py [--strength hard] [--ai-first] [--ai-vs-ai] [--depth N] [--time-limit S] [--flip]
+python -m pytest                 # fast suite (excludes @pytest.mark.slow)
+python -m pytest -m slow         # gauntlet vs legacy engine + deep perft
+python -m pytest --cov=jungle --cov-report=term-missing --cov-fail-under=80
+python scripts/perft.py          # model vs fast-core perft conformance
+python scripts/benchmark.py      # NPS benchmark
+python scripts/gauntlet.py --games 20                       # vs legacy baseline
+python scripts/gauntlet.py --baseline v1 --games 8 --depth 3  # vs frozen v1
+python scripts/gauntlet.py --baseline self --games 8          # vs features-off
+python scripts/ai_vs_ai_smoke.py 120   # full game, MUST stay a subprocess
+python package.py                # -> release/Jungle.exe + release/README.md
+python scripts/smoke_release.py  # packaged-exe validation
 ```
 
-## Architecture
+## Architecture (strict layering: gui → engine → model)
 
-- `jungle/model/` — Immutable game state, rules, and move generation.
-  - `board.py` contains `Board`, `Piece`, `Move`, `GameState`, and all legal-move / capture logic.
-  - `constants.py` defines `Side`, `Rank`, `Terrain`, board geometry, and starting layout.
-  - `zobrist.py` provides deterministic position keys shared with the engine.
-- `jungle/engine/` — AI opponent.
-  - `tables.py` precomputes cell geometry (neighbors, jumps, terrain) from model constants.
-  - `core.py` (`FastPosition`) is the fast mutable search core: flat int board, packed int moves, make/undo, incremental Zobrist keys. It must mirror `model` rules exactly; `tests/engine/test_core_differential.py` enforces this via seeded playouts.
-  - `search.py` implements iterative-deepening negamax PVS with a persistent transposition table (generation aging), aspiration windows, late move reductions, quiescence with SEE-lite pruning, killer/history/MVV-LVA ordering, mate-distance pruning, repetition-aware draw scoring, and wall-clock time management with abort. All v3 features are `SearchConfig` flag-gated so previous engine generations remain reproducible for gauntlets.
-  - `evaluation.py` provides the tapered static evaluator (`evaluate_fast`) plus the legacy-compatible `evaluate(state, perspective)` wrapper. Weights are bundled in the frozen `EvalWeights` dataclass: `DEFAULT_WEIGHTS` (current generation) vs `V2_WEIGHTS` (previous generation, new terms zeroed).
-  - `ai.py` is the public shell: `AI` (config: max depth, time limit) and `AIWorker` (QThread; `abort()`, `search_info` signal).
-  - `legacy_ai.py` freezes the original depth-limited negamax as the gauntlet baseline (excluded from coverage).
-- `jungle/gui/` — PyQt6 interface.
-  - `board_view.py` is the custom-painted board widget; handles selection, legal-move hints, and display flip.
-  - `main_window.py` wires menus, status bar, human input, AI turns, AI-vs-AI mode, difficulty presets, and search aborts.
-  - `dialogs.py` provides the new-game (mode / first move / difficulty) and game-over dialogs.
-  - `assets.py` and `styles.py` define piece rendering and application styling.
-- `scripts/` — benchmark, perft, gauntlet, and smoke-test tooling.
-- `tests/` — pytest unit, differential, tactical, integration, GUI, and slow gauntlet tests.
+- `jungle/model/` — immutable rules of record. `board.py` has `Board`,
+  `GameState`, and every rule (locked interpretations are in its docstring —
+  e.g. tiger jumps horizontally ONLY; draws: threefold repetition or
+  200 plies). `constants.py` has geometry; `zobrist.py` the keys.
+- `jungle/engine/` — AI. `core.py` (`FastPosition`: flat int board, packed
+  moves, make/undo, incremental keys AND incremental PST eval state) MUST
+  mirror the model exactly; `tests/engine/test_core_differential.py` and
+  `test_evaluation.py` enforce it via seeded playouts.
+  `search.py` = ID-PVS alpha-beta with **fresh TT per search** (persistent
+  TTs poison repetition scoring — measured strength loss); **no LMR, no
+  aspiration, no SEE** (measured harmful/neutral on this game). Strength
+  lives in `evaluation.py` terms — gauntlet-verified: `den_defense=12`
+  (8/8 vs frozen v1). `rat_river` and `rat_elephant_proximity` measured
+  HARMFUL (0/8) — keep at 0. `den_extension`/`ordered_advance` measured
+  neutral — kept off. `v1_frozen.py` is the fixed first-generation gauntlet
+  opponent; never "improve" it.
+- `jungle/gui/` — PySide6. `board_view.py` flip is a PURE display transform
+  (never touches state/sides/turn). `main_window.py` orchestrates the
+  `AIWorker(QThread)`; the GUI never blocks.
+- `main.py` — CLI entry. `package.py` — PyInstaller build with Windows
+  file-lock retries.
 
-## Key Conventions
+## Windows/Qt testing hazards (hard-won — do not regress)
 
-- `GameState` and `Board` are immutable; every move returns a new instance.
-- `FastPosition` (engine core) is the deliberate exception: mutable, make/undo, used only inside search. Public APIs exchange immutable `GameState`/`Move`; convert with `FastPosition.from_game_state` / `to_model_move`.
-- Board coordinates are `(row, col)` with `row=0` at the top (BLUE side) and `row=8` at the bottom (RED side). Engine cell indices are `row * 7 + col`; packed moves are `from_idx | (to_idx << 6)`.
-- The display flip in `BoardView` is purely visual; internal coordinates and turn order never change.
-- RED moves first by standard rules. The GUI's "who moves first" setting only decides whether the human or AI plays RED.
-- Animal piece symbols are rendered with the system emoji font.
-- The game-over dialog is shown non-blocking (`dialog.open()`); sustained in-process GUI self-play tests must run offscreen in a subprocess (see `scripts/ai_vs_ai_smoke.py`) because the Windows event loop crashes under prolonged rapid `QThread` signal delivery on some machines.
-
-## Rules Interpretation
-
-- Standard starting position: BLUE lion (0,0), tiger (0,6), dog (1,1), cat (1,5), rat (2,0), leopard (2,2), wolf (2,4), elephant (2,6); RED mirrored 180°.
-- Ranks follow Wikipedia: rat 1 < cat 2 < dog 3 < wolf 4 < leopard 5 < tiger 6 < lion 7 < elephant 8 (some Chinese sources swap dog/wolf; Wikipedia is the primary reference).
-- River: two 3×2 bodies centered on rows 3–5, columns {1,2} and {4,5}.
-- Only rats may enter river squares. A rat in the river can only capture another rat in the river; land pieces cannot capture a rat in the river.
-- Lion may jump across the river horizontally or vertically (2-cell and 3-cell spans); tiger may jump horizontally only (2-cell span).
-- Jumps are blocked by any rat in an intervening river square.
-- Rat on land can capture elephant (from a land square only); elephant cannot capture rat.
-- A piece in an opponent's trap has defensive rank 0 but attacks with its normal rank.
-- Win by entering the opponent's den, capturing all enemy pieces, or leaving the opponent with no legal moves.
-- Draw by threefold repetition or after 200 plies (100 moves per side).
-
-## Release
-
-The packaged executable and the player README (from `packaging/README.release.md`, includes the required model/code-agent credit) are produced in `release/` by `python package.py`. Validate with `python scripts\smoke_release.py` after packaging.
-Do not commit large build artifacts (`build/`, `dist/`, `*.spec`, `release/Jungle.exe`) to git; `.gitignore` covers them.
+1. GUI tests: `QT_QPA_PLATFORM=offscreen` (set in `tests/conftest.py` before
+   Qt imports). Offscreen has NO fonts — never assert on glyph shapes.
+2. Full AI-vs-AI games only via subprocess (`scripts/ai_vs_ai_smoke.py`).
+3. The game-over dialog is NEVER `exec()`'d — non-modal `show()` only.
+4. `_maybe_start_ai` must never run two AI workers at once (an earlier
+   deferred-timer design caused orphaned workers and crashes).
+5. `package.py`: taskkill the running exe first; retry deletes/copies past
+   antivirus file locks.
