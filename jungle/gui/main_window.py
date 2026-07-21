@@ -94,12 +94,26 @@ class MainWindow(QMainWindow):
 
         ai_menu = self.menuBar().addMenu("&AI")
         group = QActionGroup(self)
+        self._strength_actions: dict[str, QAction] = {}
         for name in ("easy", "medium", "hard"):
             action = QAction(name.capitalize(), self, checkable=True)
-            action.setChecked(name == self._strength)
             action.triggered.connect(lambda checked, n=name: self._on_strength_changed(n))
             group.addAction(action)
             ai_menu.addAction(action)
+            self._strength_actions[name] = action
+        self._sync_strength_actions()
+
+    def _sync_strength_actions(self) -> None:
+        """Check the AI-menu entry matching ``self._strength``.
+
+        Needed when the strength changes outside the menu itself (New Game
+        dialog, CLI start): the menu is the only difficulty indicator in the
+        game UI, so it must never contradict the AI actually in play.
+        ``setChecked`` emits ``toggled`` (not ``triggered``), and the group is
+        exclusive, so this neither recurses nor leaves two entries checked.
+        """
+        for name, action in self._strength_actions.items():
+            action.setChecked(name == self._strength)
 
     # -- game flow --------------------------------------------------------------
 
@@ -198,6 +212,7 @@ class MainWindow(QMainWindow):
         self._abort_ai()
         self._strength = strength
         self._ai = AI(strength=strength, depth=self._ai_depth, time_limit=self._time_limit)
+        self._sync_strength_actions()
         self._state = GameState.starting()
         self._human_side = None if mode == MODE_AI_VS_AI else (Side.BLUE if ai_first else Side.RED)
         if self._game_over_dialog is not None:
@@ -215,6 +230,9 @@ class MainWindow(QMainWindow):
     def _on_strength_changed(self, name: str) -> None:
         self._strength = name
         self._ai = AI(strength=name, depth=self._ai_depth, time_limit=self._time_limit)
+        # No-op when the menu itself initiated the change; keeps the menu
+        # truthful for any other caller (tests, future shortcuts).
+        self._sync_strength_actions()
 
     def _on_search_info(self, depth: int, score: int, nodes: int) -> None:
         self._ai_info_label.setText(f"d={depth}  {score / 100:+.2f}  {nodes / 1000:.1f}kN")

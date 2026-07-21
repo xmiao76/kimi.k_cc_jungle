@@ -1,5 +1,6 @@
 """Main window structure: menus, flip action, new-game dialog plumbing."""
 
+from jungle.engine.ai import DIFFICULTY_PRESETS
 from jungle.gui.dialogs import NewGameDialog
 from jungle.gui.main_window import MainWindow
 
@@ -54,6 +55,29 @@ def test_accepted_new_game_dialog_starts_fresh(qtbot, monkeypatch):
     assert window._state.move_count == 0
     assert window._human_side.name == "BLUE"  # AI moves first
     assert window._strength == "hard"
+    assert window._strength_actions["hard"].isChecked()
+    assert not window._strength_actions["easy"].isChecked()
+    window._abort_ai()
+
+
+def test_new_game_difficulty_syncs_ai_menu(qtbot):
+    # Regression: picking Hard in the New Game dialog left the AI menu
+    # showing Medium (checked only at construction) while the AI played Hard.
+    window = MainWindow()  # default strength: medium, human (RED) to move
+    qtbot.addWidget(window)
+    window.show()
+    assert window._strength_actions["medium"].isChecked()
+
+    window.start_new_game(mode="human_vs_ai", ai_first=False, strength="hard")
+
+    # The AI really is rebuilt at the hard preset...
+    assert window._strength == "hard"
+    assert window._ai.config.max_depth == DIFFICULTY_PRESETS["hard"].max_depth
+    assert window._ai.config.soft_limit_s == DIFFICULTY_PRESETS["hard"].soft_limit_s
+    # ...and the AI menu — the game UI's difficulty drop-down — agrees.
+    assert window._strength_actions["hard"].isChecked()
+    assert not window._strength_actions["medium"].isChecked()
+    assert not window._strength_actions["easy"].isChecked()
     window._abort_ai()
 
 
