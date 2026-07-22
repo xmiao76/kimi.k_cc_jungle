@@ -42,9 +42,32 @@ def _copy_with_retry(source: Path, dest: Path, attempts: int = 5, delay_s: float
             time.sleep(delay_s)
 
 
+def _current_git_ref(repo_root: Path) -> str:
+    """Return 'branch (commit)' for the current checkout, for build traceability.
+
+    The script always packages whatever is checked out in its own directory;
+    this just makes the source of each build visible in the output."""
+    try:
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, cwd=repo_root,
+        ).stdout.strip()
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, cwd=repo_root,
+        ).stdout.strip()
+    except OSError:
+        return "unknown (git not available)"
+    if not branch or branch == "HEAD":
+        branch = "detached HEAD"
+    return f"{branch} ({commit or 'unknown commit'})"
+
+
 def main() -> int:
     repo_root = Path(__file__).parent.resolve()
     os.chdir(repo_root)
+
+    print(f"Building from current checkout: {_current_git_ref(repo_root)}")
 
     dist_dir = repo_root / "dist"
     build_dir = repo_root / "build"
